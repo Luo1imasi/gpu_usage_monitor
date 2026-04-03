@@ -1,10 +1,17 @@
 import json
 import subprocess
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template, jsonify
 from pathlib import Path
 
 app = Flask(__name__)
 CONFIG_PATH = Path(__file__).parent / "config.json"
+
+cached_data = []
+last_update = None
+data_lock = threading.Lock()
 
 
 def load_config():
@@ -186,6 +193,34 @@ def get_gpu_info_ssh(server):
         return {"error": str(e), "server": server["name"]}
 
 
+def refresh_data():
+    global cached_data, last_update
+
+    config = load_config()
+    results = []
+
+    with ThreadPoolExecutor(max_workers=len(config["servers"])) as executor:
+        futures = {
+            executor.submit(get_gpu_info_ssh, server): server
+            for server in config["servers"]
+        }
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    with data_lock:
+        cached_data = results
+        last_update = time.time()
+
+
+def background_worker():
+    config = load_config()
+    interval = config.get("refresh_interval", 5)
+
+    while True:
+        refresh_data()
+        time.sleep(interval)
+
+
 @app.route("/")
 def index():
     config = load_config()
@@ -196,11 +231,8 @@ def index():
 
 @app.route("/api/gpu")
 def get_gpu():
-    config = load_config()
-    results = []
-    for server in config["servers"]:
-        results.append(get_gpu_info_ssh(server))
-    return jsonify(results)
+    with data_lock:
+        return jsonify(cached_data)
 
 
 @app.route("/api/config")
@@ -210,4 +242,9 @@ def get_config():
 
 
 if __name__ == "__main__":
+    refresh_data()
+
+    worker_thread = threading.Thread(target=background_worker, daemon=True)
+    worker_thread.start()
+
     app.run(host="0.0.0.0", port=5000, debug=True)
