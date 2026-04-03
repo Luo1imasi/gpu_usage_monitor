@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPU Monitor</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #1e1e1e;
+            color: #cccccc;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        header {
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid #3c3c3c;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        h1 {
+            font-size: 1.4em;
+            font-weight: 500;
+            color: #fff;
+        }
+        
+        .stats {
+            display: flex;
+            gap: 24px;
+            font-size: 0.85em;
+            color: #858585;
+        }
+        
+        .stat-value {
+            color: #fff;
+            font-weight: 500;
+        }
+        
+        .servers {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+            gap: 16px;
+        }
+        
+        .server-card {
+            background: #252526;
+            border-radius: 6px;
+            border: 1px solid #3c3c3c;
+            padding: 16px;
+        }
+        
+        .server-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 14px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #3c3c3c;
+        }
+        
+        .server-name {
+            font-size: 1em;
+            font-weight: 500;
+            color: #fff;
+        }
+        
+        .server-host {
+            color: #6d6d6d;
+            font-size: 0.75em;
+            margin-top: 2px;
+        }
+        
+        .status {
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 0.7em;
+            font-weight: 500;
+            text-transform: uppercase;
+        }
+        
+        .status.online {
+            background: #3c3c3c;
+            color: #4ec9b0;
+            border: 1px solid #4ec9b0;
+        }
+        
+        .status.offline {
+            background: #3c3c3c;
+            color: #f14c4c;
+            border: 1px solid #f14c4c;
+        }
+        
+        .gpu-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        
+        .gpu-item {
+            background: #1e1e1e;
+            padding: 12px;
+            border-radius: 4px;
+            border: 1px solid #3c3c3c;
+        }
+        
+        .gpu-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        
+        .gpu-name {
+            color: #dcdcaa;
+            font-weight: 500;
+            font-size: 0.85em;
+        }
+        
+        .gpu-id {
+            color: #6d6d6d;
+            font-size: 0.75em;
+            font-family: monospace;
+        }
+        
+        .metrics {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 8px;
+        }
+        
+        .metric-box {
+            flex: 1;
+        }
+        
+        .metric-label {
+            color: #6d6d6d;
+            font-size: 0.7em;
+            margin-bottom: 3px;
+        }
+        
+        .metric-value {
+            color: #ccc;
+            font-size: 0.8em;
+            font-family: monospace;
+        }
+        
+        .progress-bar {
+            background: #3c3c3c;
+            border-radius: 2px;
+            height: 5px;
+            margin-top: 4px;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.3s;
+        }
+        
+        .progress-fill.gpu { background: #569cd6; }
+        .progress-fill.memory { background: #ce9178; }
+        
+        .process-list {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid #3c3c3c;
+        }
+        
+        .process-title {
+            color: #6d6d6d;
+            font-size: 0.7em;
+            margin-bottom: 6px;
+        }
+        
+        .process-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 6px 8px;
+            background: #252526;
+            border-radius: 3px;
+            margin-bottom: 3px;
+            font-size: 0.8em;
+        }
+        
+        .process-item:last-child {
+            margin-bottom: 0;
+        }
+        
+        .process-user {
+            color: #9cdcfe;
+            font-weight: 500;
+        }
+        
+        .process-memory {
+            color: #b5cea8;
+            font-family: monospace;
+        }
+        
+        .no-process {
+            color: #6d6d6d;
+            font-size: 0.7em;
+            text-align: center;
+            padding: 6px;
+            margin-top: 8px;
+            border-top: 1px solid #3c3c3c;
+        }
+        
+        .error {
+            color: #f14c4c;
+            font-size: 0.85em;
+            padding: 12px;
+            text-align: center;
+        }
+        
+        .refresh-info {
+            text-align: center;
+            color: #6d6d6d;
+            font-size: 0.75em;
+            margin-top: 20px;
+            padding-top: 12px;
+            border-top: 1px solid #3c3c3c;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>GPU Monitor</h1>
+            <div class="stats">
+                <span>Servers: <span class="stat-value" id="total-servers">-</span></span>
+                <span>GPUs: <span class="stat-value" id="total-gpus">-</span></span>
+                <span>Processes: <span class="stat-value" id="total-processes">-</span></span>
+            </div>
+        </header>
+        <div class="servers" id="servers">Loading...</div>
+        <div class="refresh-info">Refresh: <span id="interval">-</span>s | Last: <span id="last-update">-</span></div>
+    </div>
+    
+    <script>
+        let refreshInterval = 5;
+        
+        async function init() {
+            try {
+                const r = await fetch('/api/config');
+                const cfg = await r.json();
+                refreshInterval = cfg.refresh_interval || 5;
+                document.getElementById('interval').textContent = refreshInterval;
+            } catch(e) {}
+            
+            await refresh();
+            setInterval(refresh, refreshInterval * 1000);
+        }
+        
+        async function refresh() {
+            try {
+                const r = await fetch('/api/gpu');
+                const data = await r.json();
+                render(data);
+                document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+            } catch(e) {
+                document.getElementById('servers').innerHTML = '<div class="error">Failed to fetch data</div>';
+            }
+        }
+        
+        function render(data) {
+            let online = 0, totalGpus = 0, totalProcs = 0;
+            
+            let html = data.map(s => {
+                if (s.error) {
+                    return '<div class="server-card"><div class="server-header"><div><div class="server-name">' + s.server + '</div></div><span class="status offline">Offline</span></div><div class="error">' + s.error + '</div></div>';
+                }
+                
+                online++;
+                
+                let gpuHtml = '';
+                if (s.gpus) {
+                    totalGpus += s.gpus.length;
+                    gpuHtml = s.gpus.map(g => {
+                        let procHtml = '';
+                        if (g.processes && g.processes.length > 0) {
+                            totalProcs += g.processes.length;
+                            procHtml = '<div class="process-list"><div class="process-title">Users (' + g.processes.length + ')</div>' +
+                                g.processes.map(p => '<div class="process-item"><span class="process-user">' + p.user + '</span><span class="process-memory">' + p.memory + ' MB</span></div>').join('') +
+                                '</div>';
+                        } else {
+                            procHtml = '<div class="no-process">No processes</div>';
+                        }
+                        
+                        let memPercent = g.memory_total > 0 ? (g.memory_used / g.memory_total * 100).toFixed(1) : 0;
+                        
+                        return '<div class="gpu-item"><div class="gpu-header"><span class="gpu-name">' + g.name + '</span><span class="gpu-id">GPU ' + g.index + '</span></div>' +
+                            '<div class="metrics"><div class="metric-box"><div class="metric-label">GPU</div><div class="metric-value">' + g.gpu_util + '%</div><div class="progress-bar"><div class="progress-fill gpu" style="width:' + g.gpu_util + '%"></div></div></div>' +
+                            '<div class="metric-box"><div class="metric-label">Memory</div><div class="metric-value">' + g.memory_used + '/' + g.memory_total + ' MB</div><div class="progress-bar"><div class="progress-fill memory" style="width:' + memPercent + '%"></div></div></div></div>' +
+                            procHtml + '</div>';
+                    }).join('');
+                }
+                
+                return '<div class="server-card"><div class="server-header"><div><div class="server-name">' + s.server + '</div><div class="server-host">' + s.host + '</div></div><span class="status online">Online</span></div><div class="gpu-list">' + gpuHtml + '</div></div>';
+            }).join('');
+            
+            document.getElementById('total-servers').textContent = online + '/' + data.length;
+            document.getElementById('total-gpus').textContent = totalGpus;
+            document.getElementById('total-processes').textContent = totalProcs;
+            document.getElementById('servers').innerHTML = html || '<div class="error">No servers</div>';
+        }
+        
+        init();
+    </script>
+</body>
+</html>
