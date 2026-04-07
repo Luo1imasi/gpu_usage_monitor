@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import os
+import re
 import time
 import threading
 import logging
@@ -135,6 +136,14 @@ def run_ssh_command(client, command, timeout=30):
                     pass
 
 
+def sanitize_error(error_msg):
+    sanitized = re.sub(r"\d{1,3}(\.\d{1,3}){3}", "***", error_msg)
+    sanitized = re.sub(r":\d{4,5}", ":***", sanitized)
+    sanitized = re.sub(r"/home/[\w./\-]+", "/***", sanitized)
+    sanitized = re.sub(r"/root/[\w./\-]+", "/***", sanitized)
+    return sanitized
+
+
 def parse_gpu_query(output):
     gpus = {}
     bus_to_idx = {}
@@ -210,7 +219,7 @@ def get_gpu_info_ssh(server):
         if not out.strip():
             error_msg = err.strip() if err else "No GPU info returned"
             logger.error(f"nvidia-smi error on {server['name']}: {error_msg}")
-            return {"error": error_msg, "server": server["name"]}
+            return {"error": sanitize_error(error_msg), "server": server["name"]}
 
         gpus, bus_to_idx = parse_gpu_query(out)
 
@@ -274,7 +283,7 @@ def get_gpu_info_ssh(server):
     except Exception as e:
         logger.error(f"Error getting GPU info for {server['name']}: {e}")
         invalidate_ssh_client(server)
-        return {"error": str(e), "server": server["name"]}
+        return {"error": sanitize_error(str(e)), "server": server["name"]}
 
 
 def refresh_data():
@@ -293,7 +302,7 @@ def refresh_data():
         except Exception as e:
             server = futures[future]
             logger.error(f"Unexpected error for {server['name']}: {e}")
-            results.append({"error": str(e), "server": server["name"]})
+            results.append({"error": sanitize_error(str(e)), "server": server["name"]})
 
     with data_lock:
         cached_data = results
