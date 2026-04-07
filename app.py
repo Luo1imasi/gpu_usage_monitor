@@ -1,10 +1,20 @@
+import csv
+import io
 import json
-import subprocess
+import os
 import time
 import threading
+import logging
+import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template, jsonify
 from pathlib import Path
+import paramiko
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -12,184 +22,258 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 cached_data = []
 last_update = None
 data_lock = threading.Lock()
+executor = ThreadPoolExecutor(max_workers=10)
+ssh_clients = {}
+ssh_lock = threading.Lock()
+
+_config_cache = None
+_config_mtime = 0.0
+
+
+def cleanup():
+    logger.info("Cleaning up resources...")
+    executor.shutdown(wait=False)
+    with ssh_lock:
+        for client in ssh_clients.values():
+            try:
+                client.close()
+            except Exception as e:
+                logger.debug(f"Error closing SSH client: {e}")
+        ssh_clients.clear()
+
+
+atexit.register(cleanup)
 
 
 def load_config():
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+    global _config_cache, _config_mtime
+    try:
+        mtime = CONFIG_PATH.stat().st_mtime
+        if _config_cache is not None and mtime == _config_mtime:
+            return _config_cache
+        with open(CONFIG_PATH) as f:
+            _config_cache = json.load(f)
+            _config_mtime = mtime
+            return _config_cache
+    except FileNotFoundError:
+        logger.error(f"Config file not found: {CONFIG_PATH}")
+        return {"servers": [], "refresh_interval": 5}
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in config file: {e}")
+        return {"servers": [], "refresh_interval": 5}
 
 
-def parse_nvidia_smi(output):
-    gpus = {}
-    lines = output.split("\n")
+def get_ssh_client(server):
+    key = (server["host"], server["port"], server["username"])
 
-    current_gpu_idx = None
+    with ssh_lock:
+        if key in ssh_clients:
+            client = ssh_clients[key]
+            if client.get_transport() and client.get_transport().is_active():
+                return client
+            try:
+                client.close()
+            except Exception as e:
+                logger.debug(f"Error closing stale SSH client: {e}")
+            del ssh_clients[key]
 
-    for line in lines:
-        if not line.strip():
-            continue
+    new_client = paramiko.SSHClient()
+    new_client.load_system_host_keys()
+    if server.get("accept_unknown_host", False):
+        new_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    key_file = os.path.expanduser(server["key_file"])
+    new_client.connect(
+        hostname=server["host"],
+        port=server["port"],
+        username=server["username"],
+        key_filename=key_file,
+        timeout=10,
+        banner_timeout=10,
+    )
+    transport = new_client.get_transport()
+    if transport:
+        transport.set_keepalive(30)
 
-        parts = [p.strip() for p in line.split("|")]
+    with ssh_lock:
+        if key in ssh_clients:
+            old = ssh_clients[key]
+            if old.get_transport() and old.get_transport().is_active():
+                new_client.close()
+                return old
+            try:
+                old.close()
+            except Exception:
+                pass
+        ssh_clients[key] = new_client
+        return new_client
 
-        if len(parts) >= 3:
-            first_col = parts[1].strip()
 
-            if first_col and first_col[0].isdigit() and "Off" in line:
-                tokens = first_col.split()
-                if len(tokens) >= 2:
-                    try:
-                        idx = int(tokens[0])
-                        name = " ".join(tokens[1:-1])
-                        current_gpu_idx = idx
+def invalidate_ssh_client(server):
+    key = (server["host"], server["port"], server["username"])
+    with ssh_lock:
+        if key in ssh_clients:
+            try:
+                ssh_clients[key].close()
+            except Exception:
+                pass
+            del ssh_clients[key]
 
-                        if idx not in gpus:
-                            gpus[idx] = {
-                                "index": idx,
-                                "name": name,
-                                "gpu_util": 0,
-                                "memory_used": 0,
-                                "memory_total": 0,
-                                "processes": [],
-                            }
-                    except:
-                        pass
 
-            elif first_col.startswith("N/A") and current_gpu_idx is not None:
-                for col in parts:
-                    if "MiB" in col and "/" in col:
-                        try:
-                            vals = col.split("/")
-                            mem_used = int(vals[0].strip().replace("MiB", ""))
-                            mem_total = int(vals[1].strip().replace("MiB", ""))
-                            if current_gpu_idx in gpus:
-                                gpus[current_gpu_idx]["memory_used"] = mem_used
-                                gpus[current_gpu_idx]["memory_total"] = mem_total
-                        except:
-                            pass
-
-                    if "%" in col:
-                        try:
-                            util = int(col.strip().replace("%", "").split()[0])
-                            if current_gpu_idx in gpus:
-                                gpus[current_gpu_idx]["gpu_util"] = util
-                        except:
-                            pass
-
-        if "Processes:" in line:
-            current_gpu_idx = None
-
-    for line in lines:
-        if (
-            "|" in line
-            and "MiB" in line
-            and "PID" not in line
-            and "GPU" not in line
-            and "=" not in line
-        ):
-            content = line.replace("|", " ").strip()
-            if content and content[0].isdigit():
-                tokens = content.split()
+def run_ssh_command(client, command, timeout=30):
+    stdin = stdout = stderr = None
+    try:
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        out = stdout.read().decode()
+        err = stderr.read().decode()
+        return out, err
+    finally:
+        for ch in (stdin, stdout, stderr):
+            if ch is not None:
                 try:
-                    gpu_idx = int(tokens[0])
-                    pid = int(tokens[3])
-
-                    mem = 0
-                    for i, t in enumerate(tokens):
-                        if "MiB" in t:
-                            try:
-                                mem = int(t.replace("MiB", "").replace("...", ""))
-                            except:
-                                pass
-
-                    if gpu_idx in gpus:
-                        gpus[gpu_idx]["processes"].append(
-                            {"pid": pid, "memory": mem, "user": "unknown"}
-                        )
-                except:
+                    ch.close()
+                except Exception:
                     pass
 
-    return list(gpus.values())
+
+def parse_gpu_query(output):
+    gpus = {}
+    bus_to_idx = {}
+    reader = csv.reader(io.StringIO(output))
+    for row in reader:
+        if len(row) < 6:
+            continue
+        try:
+            idx = int(row[0].strip())
+            bus_id = row[1].strip()
+            name = row[2].strip()
+            util_str = row[3].strip()
+            mem_used_str = row[4].strip()
+            mem_total_str = row[5].strip()
+            gpu_util = int(float(util_str)) if util_str not in ("[N/A]", "") else 0
+            mem_used = (
+                int(float(mem_used_str)) if mem_used_str not in ("[N/A]", "") else 0
+            )
+            mem_total = (
+                int(float(mem_total_str)) if mem_total_str not in ("[N/A]", "") else 0
+            )
+            gpus[idx] = {
+                "index": idx,
+                "name": name,
+                "gpu_util": gpu_util,
+                "memory_used": mem_used,
+                "memory_total": mem_total,
+                "processes": [],
+            }
+            bus_to_idx[bus_id] = idx
+        except (ValueError, IndexError):
+            continue
+    return gpus, bus_to_idx
+
+
+def parse_compute_apps(output, bus_to_idx, gpus):
+    if not output.strip() or "No running" in output:
+        return
+    reader = csv.reader(io.StringIO(output))
+    for row in reader:
+        if len(row) < 3:
+            continue
+        bus_id = row[0].strip()
+        pid_str = row[1].strip()
+        mem_str = row[2].strip()
+        if bus_id not in bus_to_idx:
+            continue
+        idx = bus_to_idx[bus_id]
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        mem = 0
+        try:
+            mem = int(float(mem_str.replace(" MiB", "").replace(",", "").strip()))
+        except ValueError:
+            pass
+        if idx in gpus:
+            gpus[idx]["processes"].append(
+                {"pid": pid, "memory": mem, "user": "unknown"}
+            )
 
 
 def get_gpu_info_ssh(server):
     try:
-        ssh_cmd = [
-            "ssh",
-            "-p",
-            str(server["port"]),
-            "-i",
-            server["key_file"],
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "ConnectTimeout=5",
-            f"{server['username']}@{server['host']}",
-            "nvidia-smi",
-        ]
-        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=10)
+        client = get_ssh_client(server)
 
-        if result.returncode != 0:
-            return {"error": result.stderr.strip(), "server": server["name"]}
+        gpu_fields = "index,gpu_bus_id,name,utilization.gpu,memory.used,memory.total"
+        out, err = run_ssh_command(
+            client,
+            f"nvidia-smi --query-gpu={gpu_fields} --format=csv,noheader,nounits",
+        )
+        if not out.strip():
+            error_msg = err.strip() if err else "No GPU info returned"
+            logger.error(f"nvidia-smi error on {server['name']}: {error_msg}")
+            return {"error": error_msg, "server": server["name"]}
 
-        gpus = parse_nvidia_smi(result.stdout)
+        gpus, bus_to_idx = parse_gpu_query(out)
+
+        proc_out, _ = run_ssh_command(
+            client,
+            "nvidia-smi --query-compute-apps=gpu_bus_id,pid,used_gpu_memory --format=csv,noheader",
+        )
+        parse_compute_apps(proc_out, bus_to_idx, gpus)
 
         pids = []
-        for gpu in gpus:
+        for gpu in gpus.values():
             for proc in gpu["processes"]:
                 pids.append(str(proc["pid"]))
 
         if pids:
             pid_list = ",".join(pids)
-            ssh_cmd2 = [
-                "ssh",
-                "-p",
-                str(server["port"]),
-                "-i",
-                server["key_file"],
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "ConnectTimeout=5",
-                f"{server['username']}@{server['host']}",
+            ps_out, _ = run_ssh_command(
+                client,
                 f"ps -o pid=,user= -p {pid_list} 2>/dev/null",
-            ]
-            result2 = subprocess.run(
-                ssh_cmd2, capture_output=True, text=True, timeout=10
             )
-
-            if result2.stdout:
+            if ps_out:
                 user_map = {}
-                for line in result2.stdout.strip().split("\n"):
+                for line in ps_out.strip().split("\n"):
                     if line.strip():
                         parts = line.strip().split()
                         if len(parts) >= 2:
                             user_map[parts[0]] = parts[1]
-
-                for gpu in gpus:
+                for gpu in gpus.values():
                     for proc in gpu["processes"]:
                         if str(proc["pid"]) in user_map:
                             proc["user"] = user_map[str(proc["pid"])]
 
-        for gpu in gpus:
+        for gpu in gpus.values():
             user_memory = {}
             for proc in gpu["processes"]:
                 user = proc["user"]
                 if user not in user_memory:
                     user_memory[user] = 0
                 user_memory[user] += proc["memory"]
+
+            total_proc_mem = sum(user_memory.values())
+            if total_proc_mem > 0 and gpu["memory_used"] > 0:
+                ratio = gpu["memory_used"] / total_proc_mem
+                if ratio > 1.5:
+                    if len(user_memory) == 1:
+                        user_memory[list(user_memory.keys())[0]] = gpu["memory_used"]
+                    else:
+                        for user in user_memory:
+                            proportion = user_memory[user] / total_proc_mem
+                            user_memory[user] = int(gpu["memory_used"] * proportion)
+
             gpu["processes"] = [
                 {"user": u, "memory": m} for u, m in user_memory.items()
             ]
 
         return {
             "server": server["name"],
-            "host": server["host"],
-            "gpus": sorted(gpus, key=lambda x: x["index"]),
+            "gpus": sorted(gpus.values(), key=lambda x: x["index"]),
             "error": None,
         }
-    except subprocess.TimeoutExpired:
-        return {"error": "Connection timeout", "server": server["name"]}
     except Exception as e:
+        logger.error(f"Error getting GPU info for {server['name']}: {e}")
+        invalidate_ssh_client(server)
         return {"error": str(e), "server": server["name"]}
 
 
@@ -199,26 +283,34 @@ def refresh_data():
     config = load_config()
     results = []
 
-    with ThreadPoolExecutor(max_workers=len(config["servers"])) as executor:
-        futures = {
-            executor.submit(get_gpu_info_ssh, server): server
-            for server in config["servers"]
-        }
-        for future in as_completed(futures):
+    futures = {
+        executor.submit(get_gpu_info_ssh, server): server
+        for server in config["servers"]
+    }
+    for future in as_completed(futures):
+        try:
             results.append(future.result())
+        except Exception as e:
+            server = futures[future]
+            logger.error(f"Unexpected error for {server['name']}: {e}")
+            results.append({"error": str(e), "server": server["name"]})
 
     with data_lock:
         cached_data = results
         last_update = time.time()
 
+    logger.info(f"Refreshed data for {len(results)} servers")
+
 
 def background_worker():
-    config = load_config()
-    interval = config.get("refresh_interval", 5)
-
+    logger.info("Starting background worker")
     while True:
-        refresh_data()
-        time.sleep(interval)
+        try:
+            refresh_data()
+        except Exception as e:
+            logger.error(f"Error in background worker: {e}")
+        config = load_config()
+        time.sleep(config.get("refresh_interval", 5))
 
 
 @app.route("/")
@@ -235,16 +327,22 @@ def get_gpu():
         return jsonify(cached_data)
 
 
-@app.route("/api/config")
-def get_config():
+@app.route("/api/servers")
+def get_servers():
     config = load_config()
-    return jsonify(config)
+    servers = [{"name": s["name"]} for s in config.get("servers", [])]
+    return jsonify(
+        {"servers": servers, "refresh_interval": config.get("refresh_interval", 5)}
+    )
 
 
 if __name__ == "__main__":
+    logger.info("Starting GPU usage monitor...")
     refresh_data()
 
     worker_thread = threading.Thread(target=background_worker, daemon=True)
     worker_thread.start()
 
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+    logger.info(f"Running Flask app on 0.0.0.0:5000 (debug={debug})")
+    app.run(host="0.0.0.0", port=5000, debug=debug)
