@@ -250,9 +250,15 @@
     <script>
         let refreshInterval = 5;
         
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
         async function init() {
             try {
-                const r = await fetch('/api/config');
+                const r = await fetch('/api/servers');
                 const cfg = await r.json();
                 refreshInterval = cfg.refresh_interval || 5;
                 document.getElementById('interval').textContent = refreshInterval;
@@ -269,50 +275,158 @@
                 render(data);
                 document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
             } catch(e) {
-                document.getElementById('servers').innerHTML = '<div class="error">Failed to fetch data</div>';
+                const serversDiv = document.getElementById('servers');
+                serversDiv.innerHTML = '';
+                const errorDiv = document.createElement('div');
+                errorDiv.className = 'error';
+                errorDiv.textContent = 'Failed to fetch data';
+                serversDiv.appendChild(errorDiv);
             }
         }
         
         function render(data) {
             let online = 0, totalGpus = 0, totalProcs = 0;
+            const serversDiv = document.getElementById('servers');
+            serversDiv.innerHTML = '';
             
-            let html = data.map(s => {
+            if (!data || data.length === 0) {
+                const errorDiv = document.createElement('div');
+                errorDiv.className = 'error';
+                errorDiv.textContent = 'No servers';
+                serversDiv.appendChild(errorDiv);
+                return;
+            }
+            
+            data.forEach(s => {
+                const serverCard = document.createElement('div');
+                serverCard.className = 'server-card';
+                
+                const serverHeader = document.createElement('div');
+                serverHeader.className = 'server-header';
+                
+                const serverInfo = document.createElement('div');
+                const serverName = document.createElement('div');
+                serverName.className = 'server-name';
+                serverName.textContent = s.server;
+                serverInfo.appendChild(serverName);
+                
                 if (s.error) {
-                    return '<div class="server-card"><div class="server-header"><div><div class="server-name">' + s.server + '</div></div><span class="status offline">Offline</span></div><div class="error">' + s.error + '</div></div>';
+                    const status = document.createElement('span');
+                    status.className = 'status offline';
+                    status.textContent = 'Offline';
+                    serverHeader.appendChild(serverInfo);
+                    serverHeader.appendChild(status);
+                    serverCard.appendChild(serverHeader);
+                    
+                    const errorDiv = document.createElement('div');
+                    errorDiv.className = 'error';
+                    errorDiv.textContent = s.error;
+                    serverCard.appendChild(errorDiv);
+                } else {
+                    online++;
+                    if (s.host) {
+                        const serverHost = document.createElement('div');
+                        serverHost.className = 'server-host';
+                        serverHost.textContent = s.host;
+                        serverInfo.appendChild(serverHost);
+                    }
+                    
+                    const status = document.createElement('span');
+                    status.className = 'status online';
+                    status.textContent = 'Online';
+                    serverHeader.appendChild(serverInfo);
+                    serverHeader.appendChild(status);
+                    serverCard.appendChild(serverHeader);
+                    
+                    const gpuList = document.createElement('div');
+                    gpuList.className = 'gpu-list';
+                    
+                    if (s.gpus) {
+                        totalGpus += s.gpus.length;
+                        s.gpus.forEach(g => {
+                            const gpuItem = document.createElement('div');
+                            gpuItem.className = 'gpu-item';
+                            
+                            const gpuHeader = document.createElement('div');
+                            gpuHeader.className = 'gpu-header';
+                            
+                            const gpuName = document.createElement('span');
+                            gpuName.className = 'gpu-name';
+                            gpuName.textContent = g.name;
+                            
+                            const gpuId = document.createElement('span');
+                            gpuId.className = 'gpu-id';
+                            gpuId.textContent = 'GPU ' + g.index;
+                            
+                            gpuHeader.appendChild(gpuName);
+                            gpuHeader.appendChild(gpuId);
+                            gpuItem.appendChild(gpuHeader);
+                            
+                            const metrics = document.createElement('div');
+                            metrics.className = 'metrics';
+                            
+                            const memPercent = g.memory_total > 0 ? (g.memory_used / g.memory_total * 100).toFixed(1) : 0;
+                            
+                            const metricBox1 = document.createElement('div');
+                            metricBox1.className = 'metric-box';
+                            metricBox1.innerHTML = '<div class="metric-label">GPU</div><div class="metric-value">' + g.gpu_util + '%</div><div class="progress-bar"><div class="progress-fill gpu" style="width:' + g.gpu_util + '%"></div></div>';
+                            
+                            const metricBox2 = document.createElement('div');
+                            metricBox2.className = 'metric-box';
+                            metricBox2.innerHTML = '<div class="metric-label">Memory</div><div class="metric-value">' + g.memory_used + '/' + g.memory_total + ' MB</div><div class="progress-bar"><div class="progress-fill memory" style="width:' + memPercent + '%"></div></div>';
+                            
+                            metrics.appendChild(metricBox1);
+                            metrics.appendChild(metricBox2);
+                            gpuItem.appendChild(metrics);
+                            
+                            if (g.processes && g.processes.length > 0) {
+                                totalProcs += g.processes.length;
+                                const procList = document.createElement('div');
+                                procList.className = 'process-list';
+                                
+                                const procTitle = document.createElement('div');
+                                procTitle.className = 'process-title';
+                                procTitle.textContent = 'Users (' + g.processes.length + ')';
+                                procList.appendChild(procTitle);
+                                
+                                g.processes.forEach(p => {
+                                    const procItem = document.createElement('div');
+                                    procItem.className = 'process-item';
+                                    
+                                    const procUser = document.createElement('span');
+                                    procUser.className = 'process-user';
+                                    procUser.textContent = p.user;
+                                    
+                                    const procMemory = document.createElement('span');
+                                    procMemory.className = 'process-memory';
+                                    procMemory.textContent = p.memory + ' MB';
+                                    
+                                    procItem.appendChild(procUser);
+                                    procItem.appendChild(procMemory);
+                                    procList.appendChild(procItem);
+                                });
+                                
+                                gpuItem.appendChild(procList);
+                            } else {
+                                const noProc = document.createElement('div');
+                                noProc.className = 'no-process';
+                                noProc.textContent = 'No processes';
+                                gpuItem.appendChild(noProc);
+                            }
+                            
+                            gpuList.appendChild(gpuItem);
+                        });
+                    }
+                    
+                    serverCard.appendChild(gpuList);
                 }
                 
-                online++;
-                
-                let gpuHtml = '';
-                if (s.gpus) {
-                    totalGpus += s.gpus.length;
-                    gpuHtml = s.gpus.map(g => {
-                        let procHtml = '';
-                        if (g.processes && g.processes.length > 0) {
-                            totalProcs += g.processes.length;
-                            procHtml = '<div class="process-list"><div class="process-title">Users (' + g.processes.length + ')</div>' +
-                                g.processes.map(p => '<div class="process-item"><span class="process-user">' + p.user + '</span><span class="process-memory">' + p.memory + ' MB</span></div>').join('') +
-                                '</div>';
-                        } else {
-                            procHtml = '<div class="no-process">No processes</div>';
-                        }
-                        
-                        let memPercent = g.memory_total > 0 ? (g.memory_used / g.memory_total * 100).toFixed(1) : 0;
-                        
-                        return '<div class="gpu-item"><div class="gpu-header"><span class="gpu-name">' + g.name + '</span><span class="gpu-id">GPU ' + g.index + '</span></div>' +
-                            '<div class="metrics"><div class="metric-box"><div class="metric-label">GPU</div><div class="metric-value">' + g.gpu_util + '%</div><div class="progress-bar"><div class="progress-fill gpu" style="width:' + g.gpu_util + '%"></div></div></div>' +
-                            '<div class="metric-box"><div class="metric-label">Memory</div><div class="metric-value">' + g.memory_used + '/' + g.memory_total + ' MB</div><div class="progress-bar"><div class="progress-fill memory" style="width:' + memPercent + '%"></div></div></div></div>' +
-                            procHtml + '</div>';
-                    }).join('');
-                }
-                
-                return '<div class="server-card"><div class="server-header"><div><div class="server-name">' + s.server + '</div><div class="server-host">' + s.host + '</div></div><span class="status online">Online</span></div><div class="gpu-list">' + gpuHtml + '</div></div>';
-            }).join('');
+                serversDiv.appendChild(serverCard);
+            });
             
             document.getElementById('total-servers').textContent = online + '/' + data.length;
             document.getElementById('total-gpus').textContent = totalGpus;
             document.getElementById('total-processes').textContent = totalProcs;
-            document.getElementById('servers').innerHTML = html || '<div class="error">No servers</div>';
         }
         
         init();
