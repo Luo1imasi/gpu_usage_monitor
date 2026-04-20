@@ -304,6 +304,8 @@ def refresh_data():
             logger.error(f"Unexpected error for {server['name']}: {e}")
             results.append({"error": sanitize_error(str(e)), "server": server["name"]})
 
+    results.sort(key=lambda x: x["server"])
+
     with data_lock:
         cached_data = results
         last_update = time.time()
