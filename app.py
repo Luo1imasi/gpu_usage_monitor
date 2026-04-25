@@ -9,9 +9,14 @@ import threading
 import logging
 import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, request
 from pathlib import Path
 import paramiko
+
+try:
+    from config import ADMIN_TOKEN as config_admin_token
+except ImportError:
+    config_admin_token = ""
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -22,6 +27,7 @@ app = Flask(__name__)
 CONFIG_PATH = Path(__file__).parent / "config.json"
 USER_FILE_PATH = Path(__file__).parent / "user.txt"
 USERNAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
+ADMIN_TOKEN_ENV = "GPU_MONITOR_ADMIN_TOKEN"
 
 cached_data = []
 last_update = None
@@ -191,15 +197,285 @@ def load_user_keys():
                     continue
                 fingerprint = key_fingerprint(ssh_key)
                 if username not in users:
-                    users[username] = {"username": username, "key_hashes": set()}
+                    users[username] = {
+                        "username": username,
+                        "key_hashes": set(),
+                        "ssh_keys": [],
+                    }
                 users[username]["key_hashes"].add(fingerprint)
+                if ssh_key not in users[username]["ssh_keys"]:
+                    users[username]["ssh_keys"].append(ssh_key)
     except FileNotFoundError:
         logger.error(f"User file not found: {USER_FILE_PATH}")
 
     return [
-        {"username": user["username"], "key_hashes": sorted(user["key_hashes"])}
+        {
+            "username": user["username"],
+            "key_hashes": sorted(user["key_hashes"]),
+            "ssh_keys": user["ssh_keys"],
+        }
         for user in sorted(users.values(), key=lambda item: item["username"])
     ]
+
+
+def get_servers_by_name():
+    config = load_config()
+    servers = config.get("servers", [])
+    if not isinstance(servers, list):
+        return {}
+    return {
+        server["name"]: server
+        for server in servers
+        if isinstance(server, dict) and isinstance(server.get("name"), str)
+    }
+
+
+def get_configured_servers():
+    config = load_config()
+    servers = config.get("servers", [])
+    if not isinstance(servers, list):
+        return []
+    return [
+        server
+        for server in servers
+        if isinstance(server, dict) and isinstance(server.get("name"), str)
+    ]
+
+
+def get_refresh_interval():
+    config = load_config()
+    interval = config.get("refresh_interval", 5)
+    return interval if isinstance(interval, (int, float)) else 5
+
+
+def get_users_by_name():
+    return {user["username"]: user for user in load_user_keys()}
+
+
+def build_configure_users_command(users):
+    safe_users = [
+        {"username": user["username"], "ssh_keys": user["ssh_keys"]}
+        for user in users
+    ]
+    script = f"""
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+
+users = {json.dumps(safe_users)}
+username_pattern = re.compile(r"^[a-z_][a-z0-9_-]*\\$?$")
+
+def run(args):
+    return subprocess.run(args, check=False, capture_output=True, text=True)
+
+def group_exists(name):
+    return run(["getent", "group", name]).returncode == 0
+
+admin_group = None
+if group_exists("sudo"):
+    admin_group = "sudo"
+elif group_exists("wheel"):
+    admin_group = "wheel"
+
+results = {{}}
+
+for item in users:
+    username = item["username"]
+    ssh_keys = item["ssh_keys"]
+    result = {{
+        "created": False,
+        "already_exists": False,
+        "admin_group": admin_group,
+        "admin_group_added": False,
+        "sudoers_configured": False,
+        "keys_added": 0,
+        "keys_already_present": 0,
+        "errors": [],
+    }}
+    results[username] = result
+
+    if not username_pattern.match(username):
+        result["errors"].append("invalid_username")
+        continue
+
+    try:
+        pwd.getpwnam(username)
+        result["already_exists"] = True
+    except KeyError:
+        proc = run(["useradd", "-m", "-s", "/bin/bash", username])
+        if proc.returncode != 0:
+            result["errors"].append(proc.stderr.strip() or "useradd_failed")
+            continue
+        result["created"] = True
+
+    try:
+        entry = pwd.getpwnam(username)
+        user_home = entry.pw_dir
+        ssh_dir = os.path.join(user_home, ".ssh")
+        auth_keys = os.path.join(ssh_dir, "authorized_keys")
+
+        os.makedirs(ssh_dir, exist_ok=True)
+        os.chmod(ssh_dir, 0o700)
+        shutil.chown(ssh_dir, user=username, group=username)
+
+        if admin_group:
+            groups_proc = run(["id", "-nG", username])
+            groups = groups_proc.stdout.split()
+            if admin_group not in groups:
+                proc = run(["usermod", "-aG", admin_group, username])
+                if proc.returncode == 0:
+                    result["admin_group_added"] = True
+                else:
+                    result["errors"].append(proc.stderr.strip() or "usermod_failed")
+
+        sudo_config_file = os.path.join("/etc/sudoers.d", username)
+        with open(sudo_config_file, "w") as f:
+            f.write(f"{{username}} ALL=(ALL) NOPASSWD:ALL\\n")
+        os.chmod(sudo_config_file, 0o440)
+        proc = run(["visudo", "-c", "-f", sudo_config_file])
+        if proc.returncode == 0:
+            result["sudoers_configured"] = True
+        else:
+            os.remove(sudo_config_file)
+            result["errors"].append(proc.stderr.strip() or "visudo_failed")
+
+        existing_keys = set()
+        if os.path.exists(auth_keys):
+            with open(auth_keys) as f:
+                existing_keys = {{" ".join(line.strip().split()) for line in f if line.strip()}}
+
+        with open(auth_keys, "a") as f:
+            for ssh_key in ssh_keys:
+                normalized_key = " ".join(ssh_key.strip().split())
+                if normalized_key in existing_keys:
+                    result["keys_already_present"] += 1
+                    continue
+                f.write(normalized_key + "\\n")
+                existing_keys.add(normalized_key)
+                result["keys_added"] += 1
+
+        os.chmod(auth_keys, 0o600)
+        shutil.chown(auth_keys, user=username, group=username)
+    except Exception as exc:
+        result["errors"].append(exc.__class__.__name__)
+
+print(json.dumps(results, ensure_ascii=False))
+"""
+    return f"sudo -n python3 - <<'PY'\n{script}\nPY"
+
+
+def configure_access_for_server(server, users):
+    try:
+        client = get_ssh_client(server)
+        status, out, err = run_ssh_command_status(
+            client, build_configure_users_command(users), timeout=120
+        )
+        if status != 0:
+            message = err.strip() or out.strip() or "configure command failed"
+            return {"server": server["name"], "error": sanitize_error(message), "users": {}}
+
+        return {
+            "server": server["name"],
+            "error": None,
+            "users": json.loads(out),
+        }
+    except Exception as e:
+        logger.error(f"Error configuring user access for {server['name']}: {e}")
+        invalidate_ssh_client(server)
+        return {"server": server["name"], "error": sanitize_error(str(e)), "users": {}}
+
+
+def configure_selected_access(server_names, usernames):
+    servers_by_name = get_servers_by_name()
+    users_by_name = get_users_by_name()
+
+    unknown_servers = sorted(set(server_names) - set(servers_by_name))
+    unknown_users = sorted(set(usernames) - set(users_by_name))
+    if unknown_servers or unknown_users:
+        return {
+            "error": "invalid_selection",
+            "unknown_servers": unknown_servers,
+            "unknown_users": unknown_users,
+            "results": [],
+        }, 400
+
+    selected_servers = [servers_by_name[name] for name in server_names]
+    selected_users = [users_by_name[username] for username in usernames]
+
+    futures = {
+        executor.submit(configure_access_for_server, server, selected_users): server
+        for server in selected_servers
+    }
+    results = []
+    for future in as_completed(futures):
+        server = futures[future]
+        try:
+            results.append(future.result())
+        except Exception as e:
+            logger.error(f"Unexpected configure error for {server['name']}: {e}")
+            results.append({"server": server["name"], "error": sanitize_error(str(e)), "users": {}})
+
+    results.sort(key=lambda item: item["server"])
+    return {"error": None, "results": results}, 200
+
+
+def configure_access_pairs(pairs):
+    servers_by_name = get_servers_by_name()
+    users_by_name = get_users_by_name()
+
+    grouped_users = {}
+    unknown_servers = set()
+    unknown_users = set()
+
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            return {"error": "pairs_must_contain_objects", "results": []}, 400
+        server_name = pair.get("server")
+        username = pair.get("user")
+        if not isinstance(server_name, str) or not isinstance(username, str):
+            return {"error": "pair_server_and_user_must_be_strings", "results": []}, 400
+        if server_name not in servers_by_name:
+            unknown_servers.add(server_name)
+        if username not in users_by_name:
+            unknown_users.add(username)
+        grouped_users.setdefault(server_name, set()).add(username)
+
+    if unknown_servers or unknown_users:
+        return {
+            "error": "invalid_selection",
+            "unknown_servers": sorted(unknown_servers),
+            "unknown_users": sorted(unknown_users),
+            "results": [],
+        }, 400
+
+    futures = {}
+    for server_name, server_users in grouped_users.items():
+        selected_users = [users_by_name[username] for username in sorted(server_users)]
+        server = servers_by_name[server_name]
+        futures[executor.submit(configure_access_for_server, server, selected_users)] = server
+
+    results = []
+    for future in as_completed(futures):
+        server = futures[future]
+        try:
+            results.append(future.result())
+        except Exception as e:
+            logger.error(f"Unexpected configure error for {server['name']}: {e}")
+            results.append({"server": server["name"], "error": sanitize_error(str(e)), "users": {}})
+
+    results.sort(key=lambda item: item["server"])
+    return {"error": None, "results": results}, 200
+
+
+def is_admin_authorized():
+    expected_token = os.environ.get(ADMIN_TOKEN_ENV) or config_admin_token
+    if not expected_token:
+        return False
+    supplied_token = request.headers.get("X-Admin-Token", "")
+    return supplied_token == expected_token
 
 
 def build_access_check_command(usernames, use_sudo=True):
@@ -272,9 +548,8 @@ def check_access_matrix_for_server(server, users):
 
 
 def build_access_matrix():
-    config = load_config()
     users = load_user_keys()
-    servers = config.get("servers", [])
+    servers = get_configured_servers()
 
     matrix = {
         "servers": [{"name": server["name"]} for server in servers],
@@ -469,12 +744,12 @@ def get_gpu_info_ssh(server):
 def refresh_data():
     global cached_data, last_update
 
-    config = load_config()
+    servers = get_configured_servers()
     results = []
 
     futures = {
         executor.submit(get_gpu_info_ssh, server): server
-        for server in config["servers"]
+        for server in servers
     }
     for future in as_completed(futures):
         try:
@@ -500,16 +775,12 @@ def background_worker():
             refresh_data()
         except Exception as e:
             logger.error(f"Error in background worker: {e}")
-        config = load_config()
-        time.sleep(config.get("refresh_interval", 5))
+        time.sleep(get_refresh_interval())
 
 
 @app.route("/")
 def index():
-    config = load_config()
-    return render_template(
-        "index.html", refresh_interval=config.get("refresh_interval", 5)
-    )
+    return render_template("index.html", refresh_interval=get_refresh_interval())
 
 
 @app.route("/api/gpu")
@@ -520,16 +791,44 @@ def get_gpu():
 
 @app.route("/api/servers")
 def get_servers():
-    config = load_config()
-    servers = [{"name": s["name"]} for s in config.get("servers", [])]
+    servers = [{"name": s["name"]} for s in get_configured_servers()]
     return jsonify(
-        {"servers": servers, "refresh_interval": config.get("refresh_interval", 5)}
+        {"servers": servers, "refresh_interval": get_refresh_interval()}
     )
 
 
 @app.route("/api/access-matrix")
 def get_access_matrix():
     return jsonify(build_access_matrix())
+
+
+@app.route("/api/configure-access", methods=["POST"])
+def configure_access():
+    if not is_admin_authorized():
+        return jsonify({"error": "admin_token_required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    pairs = payload.get("pairs")
+    if pairs is not None:
+        if not isinstance(pairs, list) or not pairs:
+            return jsonify({"error": "select_at_least_one_access_pair"}), 400
+        result, status_code = configure_access_pairs(pairs)
+        return jsonify(result), status_code
+
+    server_names = payload.get("servers", [])
+    usernames = payload.get("users", [])
+
+    if not isinstance(server_names, list) or not isinstance(usernames, list):
+        return jsonify({"error": "servers_and_users_must_be_lists"}), 400
+
+    server_names = [name for name in server_names if isinstance(name, str)]
+    usernames = [username for username in usernames if isinstance(username, str)]
+
+    if not server_names or not usernames:
+        return jsonify({"error": "select_at_least_one_server_and_user"}), 400
+
+    result, status_code = configure_selected_access(server_names, usernames)
+    return jsonify(result), status_code
 
 
 if __name__ == "__main__":

@@ -79,6 +79,36 @@
             font-size: 0.75em;
         }
 
+        .access-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .access-actions button {
+            background: #0e639c;
+            color: #fff;
+            border: 1px solid #1177bb;
+            border-radius: 4px;
+            padding: 6px 10px;
+            cursor: pointer;
+            font-size: 0.8em;
+        }
+
+        .access-actions button:disabled {
+            background: #3c3c3c;
+            border-color: #4a4a4a;
+            color: #858585;
+            cursor: not-allowed;
+        }
+
+        .access-result {
+            color: #858585;
+            font-size: 0.8em;
+        }
+
         .access-table-wrap {
             overflow-x: auto;
         }
@@ -101,6 +131,10 @@
             color: #dcdcaa;
             background: #1e1e1e;
             font-weight: 500;
+        }
+
+        .access-table input[type="checkbox"] {
+            cursor: pointer;
         }
 
         .access-user {
@@ -316,6 +350,12 @@
                 <div class="access-title">用户访问权限</div>
                 <div class="access-meta" id="access-meta">Loading...</div>
             </div>
+            <div class="access-actions">
+                <button id="configure-access" type="button">为选中用户配置选中服务器</button>
+                <button id="select-missing-access" type="button">选择缺失权限</button>
+                <button id="clear-access-selection" type="button">清空选择</button>
+                <span class="access-result" id="access-result"></span>
+            </div>
             <div class="access-table-wrap" id="access-matrix">Loading...</div>
         </div>
         <div class="servers" id="servers">Loading...</div>
@@ -324,6 +364,7 @@
     
     <script>
         let refreshInterval = 5;
+        let latestAccessMatrix = null;
         
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -332,6 +373,10 @@
         }
         
         async function init() {
+            document.getElementById('configure-access').addEventListener('click', configureSelectedAccess);
+            document.getElementById('select-missing-access').addEventListener('click', selectMissingAccess);
+            document.getElementById('clear-access-selection').addEventListener('click', clearAccessSelection);
+
             try {
                 const r = await fetch('/api/servers');
                 const cfg = await r.json();
@@ -381,6 +426,7 @@
             const matrixDiv = document.getElementById('access-matrix');
             const metaDiv = document.getElementById('access-meta');
             matrixDiv.innerHTML = '';
+            latestAccessMatrix = data;
 
             const users = data && data.users ? data.users : [];
             const servers = data && data.servers ? data.servers : [];
@@ -421,20 +467,32 @@
 
                 user.servers.forEach(status => {
                     const cell = document.createElement('td');
+                    const label = document.createElement('label');
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.className = 'access-pair-select';
+                    checkbox.dataset.user = user.username;
+                    checkbox.dataset.server = status.server;
+                    checkbox.disabled = Boolean(status.error || status.accessible);
+                    label.appendChild(checkbox);
+                    label.appendChild(document.createTextNode(' '));
+                    const statusText = document.createElement('span');
                     if (status.error) {
                         cell.className = 'access-error';
-                        cell.textContent = '错误';
+                        statusText.textContent = '错误';
                         cell.title = status.error;
                     } else if (status.accessible) {
                         cell.className = 'access-ok';
-                        cell.textContent = '已开通';
+                        statusText.textContent = '已开通';
                     } else if (status.user_exists) {
                         cell.className = 'access-missing';
-                        cell.textContent = status.key_installed === false ? '缺少Key' : '不可确认';
+                        statusText.textContent = status.key_installed === false ? '缺少Key' : '不可确认';
                     } else {
                         cell.className = 'access-missing';
-                        cell.textContent = '无用户';
+                        statusText.textContent = '无用户';
                     }
+                    label.appendChild(statusText);
+                    cell.appendChild(label);
                     row.appendChild(cell);
                 });
 
@@ -442,6 +500,112 @@
             });
             table.appendChild(tbody);
             matrixDiv.appendChild(table);
+        }
+
+        function getSelectedPairs() {
+            return Array.from(document.querySelectorAll('.access-pair-select:checked')).map(input => ({
+                user: input.dataset.user,
+                server: input.dataset.server
+            }));
+        }
+
+        function setAccessResult(message, isError) {
+            const resultDiv = document.getElementById('access-result');
+            resultDiv.textContent = message;
+            resultDiv.className = isError ? 'access-result access-error' : 'access-result access-ok';
+        }
+
+        function clearAccessSelection() {
+            document.querySelectorAll('.access-pair-select').forEach(input => {
+                input.checked = false;
+            });
+            setAccessResult('', false);
+        }
+
+        function selectMissingAccess() {
+            clearAccessSelection();
+            if (!latestAccessMatrix || !latestAccessMatrix.users || !latestAccessMatrix.servers) {
+                setAccessResult('暂无权限矩阵数据', true);
+                return;
+            }
+
+            const missingPairs = new Set();
+            latestAccessMatrix.users.forEach(user => {
+                (user.servers || []).forEach(status => {
+                    if (!status.accessible && !status.error) {
+                        missingPairs.add(user.username + '\u0000' + status.server);
+                    }
+                });
+            });
+
+            document.querySelectorAll('.access-pair-select').forEach(input => {
+                input.checked = missingPairs.has(input.dataset.user + '\u0000' + input.dataset.server);
+            });
+            setAccessResult('已精确选择缺失权限单元格', false);
+        }
+
+        function summarizeConfigureResults(results) {
+            let serverCount = 0;
+            let userCount = 0;
+            let keyCount = 0;
+            let errorCount = 0;
+
+            (results || []).forEach(server => {
+                serverCount++;
+                if (server.error) {
+                    errorCount++;
+                    return;
+                }
+                Object.keys(server.users || {}).forEach(username => {
+                    const item = server.users[username];
+                    userCount++;
+                    keyCount += item.keys_added || 0;
+                    errorCount += (item.errors || []).length;
+                });
+            });
+
+            return '完成 ' + serverCount + ' 台服务器 / ' + userCount + ' 个用户，新增 ' + keyCount + ' 个 Key，错误 ' + errorCount + ' 个';
+        }
+
+        async function configureSelectedAccess() {
+            const button = document.getElementById('configure-access');
+            const pairs = getSelectedPairs();
+
+            if (pairs.length === 0) {
+                setAccessResult('请至少选择一个用户-服务器权限单元格', true);
+                return;
+            }
+
+            const adminToken = window.prompt('请输入管理 Token');
+            if (!adminToken) {
+                setAccessResult('已取消配置：缺少管理 Token', true);
+                return;
+            }
+
+            button.disabled = true;
+            setAccessResult('正在配置，请稍候...', false);
+
+            try {
+                const response = await fetch('/api/configure-access', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Admin-Token': adminToken
+                    },
+                    body: JSON.stringify({pairs: pairs})
+                });
+                const data = await response.json();
+                if (!response.ok || data.error) {
+                    setAccessResult('配置失败: ' + (data.error || response.status), true);
+                    return;
+                }
+                setAccessResult(summarizeConfigureResults(data.results), false);
+                await refreshAccessMatrix();
+            } catch(e) {
+                setAccessResult('配置请求失败', true);
+            } finally {
+                button.disabled = false;
+            }
         }
         
         function render(data) {

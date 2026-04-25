@@ -10,7 +10,13 @@ pip install -r requirements.txt
 
 ## 配置
 
-编辑 `config.json`，添加你的服务器信息：
+复制示例配置并编辑本地 `config.json`，添加你的服务器信息：
+
+```bash
+cp config.example.json config.json
+```
+
+`config.json` 是实际运行时读取的本地配置，包含服务器地址、用户名、密钥路径等敏感信息，已被 `.gitignore` 忽略；提交代码时请只提交 `config.example.json`。
 
 ```json
 {
