@@ -52,6 +52,74 @@
             grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
             gap: 16px;
         }
+
+        .access-panel {
+            background: #252526;
+            border: 1px solid #3c3c3c;
+            border-radius: 6px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        .access-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .access-title {
+            color: #fff;
+            font-size: 1em;
+            font-weight: 500;
+        }
+
+        .access-meta {
+            color: #6d6d6d;
+            font-size: 0.75em;
+        }
+
+        .access-table-wrap {
+            overflow-x: auto;
+        }
+
+        .access-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.8em;
+        }
+
+        .access-table th,
+        .access-table td {
+            border: 1px solid #3c3c3c;
+            padding: 8px;
+            text-align: center;
+            white-space: nowrap;
+        }
+
+        .access-table th {
+            color: #dcdcaa;
+            background: #1e1e1e;
+            font-weight: 500;
+        }
+
+        .access-user {
+            color: #9cdcfe;
+            font-weight: 500;
+            text-align: left !important;
+        }
+
+        .access-ok {
+            color: #4ec9b0;
+        }
+
+        .access-missing {
+            color: #ce9178;
+        }
+
+        .access-error {
+            color: #f14c4c;
+        }
         
         .server-card {
             background: #252526;
@@ -243,6 +311,13 @@
                 <span>Processes: <span class="stat-value" id="total-processes">-</span></span>
             </div>
         </header>
+        <div class="access-panel">
+            <div class="access-header">
+                <div class="access-title">用户访问权限</div>
+                <div class="access-meta" id="access-meta">Loading...</div>
+            </div>
+            <div class="access-table-wrap" id="access-matrix">Loading...</div>
+        </div>
         <div class="servers" id="servers">Loading...</div>
         <div class="refresh-info">Refresh: <span id="interval">-</span>s | Last: <span id="last-update">-</span></div>
     </div>
@@ -273,6 +348,7 @@
                 const r = await fetch('/api/gpu');
                 const data = await r.json();
                 render(data);
+                await refreshAccessMatrix();
                 document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
             } catch(e) {
                 const serversDiv = document.getElementById('servers');
@@ -282,6 +358,90 @@
                 errorDiv.textContent = 'Failed to fetch data';
                 serversDiv.appendChild(errorDiv);
             }
+        }
+
+        async function refreshAccessMatrix() {
+            const matrixDiv = document.getElementById('access-matrix');
+            const metaDiv = document.getElementById('access-meta');
+            try {
+                const r = await fetch('/api/access-matrix');
+                const data = await r.json();
+                renderAccessMatrix(data);
+            } catch(e) {
+                matrixDiv.innerHTML = '';
+                const errorDiv = document.createElement('div');
+                errorDiv.className = 'error';
+                errorDiv.textContent = 'Failed to fetch access matrix';
+                matrixDiv.appendChild(errorDiv);
+                metaDiv.textContent = 'Error';
+            }
+        }
+
+        function renderAccessMatrix(data) {
+            const matrixDiv = document.getElementById('access-matrix');
+            const metaDiv = document.getElementById('access-meta');
+            matrixDiv.innerHTML = '';
+
+            const users = data && data.users ? data.users : [];
+            const servers = data && data.servers ? data.servers : [];
+            metaDiv.textContent = users.length + ' users / ' + servers.length + ' servers';
+
+            if (users.length === 0 || servers.length === 0) {
+                const emptyDiv = document.createElement('div');
+                emptyDiv.className = 'error';
+                emptyDiv.textContent = 'No users or servers configured';
+                matrixDiv.appendChild(emptyDiv);
+                return;
+            }
+
+            const table = document.createElement('table');
+            table.className = 'access-table';
+
+            const thead = document.createElement('thead');
+            const headerRow = document.createElement('tr');
+            const userHeader = document.createElement('th');
+            userHeader.textContent = '用户';
+            headerRow.appendChild(userHeader);
+
+            servers.forEach(server => {
+                const th = document.createElement('th');
+                th.textContent = server.name;
+                headerRow.appendChild(th);
+            });
+            thead.appendChild(headerRow);
+            table.appendChild(thead);
+
+            const tbody = document.createElement('tbody');
+            users.forEach(user => {
+                const row = document.createElement('tr');
+                const userCell = document.createElement('td');
+                userCell.className = 'access-user';
+                userCell.textContent = user.username + ' (' + user.key_count + ' keys)';
+                row.appendChild(userCell);
+
+                user.servers.forEach(status => {
+                    const cell = document.createElement('td');
+                    if (status.error) {
+                        cell.className = 'access-error';
+                        cell.textContent = '错误';
+                        cell.title = status.error;
+                    } else if (status.accessible) {
+                        cell.className = 'access-ok';
+                        cell.textContent = '已开通';
+                    } else if (status.user_exists) {
+                        cell.className = 'access-missing';
+                        cell.textContent = status.key_installed === false ? '缺少Key' : '不可确认';
+                    } else {
+                        cell.className = 'access-missing';
+                        cell.textContent = '无用户';
+                    }
+                    row.appendChild(cell);
+                });
+
+                tbody.appendChild(row);
+            });
+            table.appendChild(tbody);
+            matrixDiv.appendChild(table);
         }
         
         function render(data) {

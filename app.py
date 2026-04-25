@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import io
 import json
 import os
@@ -19,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CONFIG_PATH = Path(__file__).parent / "config.json"
+USER_FILE_PATH = Path(__file__).parent / "user.txt"
+USERNAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
 
 cached_data = []
 last_update = None
@@ -136,12 +139,189 @@ def run_ssh_command(client, command, timeout=30):
                     pass
 
 
+def run_ssh_command_status(client, command, timeout=30):
+    stdin = stdout = stderr = None
+    try:
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        out = stdout.read().decode()
+        err = stderr.read().decode()
+        status = stdout.channel.recv_exit_status()
+        return status, out, err
+    finally:
+        for ch in (stdin, stdout, stderr):
+            if ch is not None:
+                try:
+                    ch.close()
+                except Exception:
+                    pass
+
+
 def sanitize_error(error_msg):
     sanitized = re.sub(r"\d{1,3}(\.\d{1,3}){3}", "***", error_msg)
     sanitized = re.sub(r":\d{4,5}", ":***", sanitized)
     sanitized = re.sub(r"/home/[\w./\-]+", "/***", sanitized)
     sanitized = re.sub(r"/root/[\w./\-]+", "/***", sanitized)
     return sanitized
+
+
+def normalize_ssh_key(key):
+    return " ".join(key.strip().split())
+
+
+def key_fingerprint(key):
+    normalized = normalize_ssh_key(key)
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def load_user_keys():
+    users = {}
+    try:
+        with open(USER_FILE_PATH) as f:
+            for line_no, line in enumerate(f, start=1):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                parts = stripped.split(None, 1)
+                if len(parts) != 2:
+                    logger.warning(f"Invalid user line {line_no} in {USER_FILE_PATH}")
+                    continue
+                username, ssh_key = parts
+                if not USERNAME_PATTERN.match(username):
+                    logger.warning(f"Invalid username {username} in {USER_FILE_PATH}")
+                    continue
+                fingerprint = key_fingerprint(ssh_key)
+                if username not in users:
+                    users[username] = {"username": username, "key_hashes": set()}
+                users[username]["key_hashes"].add(fingerprint)
+    except FileNotFoundError:
+        logger.error(f"User file not found: {USER_FILE_PATH}")
+
+    return [
+        {"username": user["username"], "key_hashes": sorted(user["key_hashes"])}
+        for user in sorted(users.values(), key=lambda item: item["username"])
+    ]
+
+
+def build_access_check_command(usernames, use_sudo=True):
+    runner = "sudo -n python3 -" if use_sudo else "python3 -"
+    script = f"""
+import hashlib
+import json
+import os
+import pwd
+
+usernames = {json.dumps(usernames)}
+results = {{}}
+
+for username in usernames:
+    item = {{
+        "user_exists": False,
+        "authorized_keys_readable": False,
+        "authorized_key_hashes": [],
+        "error": None,
+    }}
+    try:
+        entry = pwd.getpwnam(username)
+        item["user_exists"] = True
+        auth_keys = os.path.join(entry.pw_dir, ".ssh", "authorized_keys")
+        try:
+            with open(auth_keys) as f:
+                hashes = []
+                for line in f:
+                    normalized = " ".join(line.strip().split())
+                    if normalized and not normalized.startswith("#"):
+                        hashes.append(hashlib.sha256(normalized.encode()).hexdigest())
+                item["authorized_keys_readable"] = True
+                item["authorized_key_hashes"] = sorted(set(hashes))
+        except FileNotFoundError:
+            item["authorized_keys_readable"] = True
+        except PermissionError:
+            item["error"] = "permission_denied"
+        except OSError as exc:
+            item["error"] = exc.__class__.__name__
+    except KeyError:
+        pass
+    results[username] = item
+
+print(json.dumps(results))
+"""
+    return f"{runner} <<'PY'\n{script}\nPY"
+
+
+def check_access_matrix_for_server(server, users):
+    usernames = [user["username"] for user in users]
+    try:
+        client = get_ssh_client(server)
+        status, out, err = run_ssh_command_status(
+            client, build_access_check_command(usernames, use_sudo=True), timeout=30
+        )
+        if status != 0:
+            status, out, err = run_ssh_command_status(
+                client, build_access_check_command(usernames, use_sudo=False), timeout=30
+            )
+        if status != 0:
+            message = err.strip() or out.strip() or "access check command failed"
+            return {"server": server["name"], "error": sanitize_error(message), "users": {}}
+
+        remote_users = json.loads(out)
+        return {"server": server["name"], "error": None, "users": remote_users}
+    except Exception as e:
+        logger.error(f"Error checking user access for {server['name']}: {e}")
+        invalidate_ssh_client(server)
+        return {"server": server["name"], "error": sanitize_error(str(e)), "users": {}}
+
+
+def build_access_matrix():
+    config = load_config()
+    users = load_user_keys()
+    servers = config.get("servers", [])
+
+    matrix = {
+        "servers": [{"name": server["name"]} for server in servers],
+        "users": [
+            {"username": user["username"], "key_count": len(user["key_hashes"]), "servers": []}
+            for user in users
+        ],
+    }
+
+    if not users or not servers:
+        return matrix
+
+    futures = {
+        executor.submit(check_access_matrix_for_server, server, users): server
+        for server in servers
+    }
+    server_results = {}
+    for future in as_completed(futures):
+        server = futures[future]
+        try:
+            result = future.result()
+        except Exception as e:
+            logger.error(f"Unexpected access check error for {server['name']}: {e}")
+            result = {"server": server["name"], "error": sanitize_error(str(e)), "users": {}}
+        server_results[result["server"]] = result
+
+    for user_item, source_user in zip(matrix["users"], users):
+        expected_hashes = set(source_user["key_hashes"])
+        for server in servers:
+            server_name = server["name"]
+            server_result = server_results.get(server_name, {"error": "No result", "users": {}})
+            remote_user = server_result.get("users", {}).get(source_user["username"], {})
+            installed_hashes = set(remote_user.get("authorized_key_hashes", []))
+            matching_keys = len(expected_hashes & installed_hashes)
+            key_installed = matching_keys > 0 if remote_user.get("authorized_keys_readable") else None
+            user_item["servers"].append(
+                {
+                    "server": server_name,
+                    "user_exists": bool(remote_user.get("user_exists")),
+                    "key_installed": key_installed,
+                    "accessible": bool(remote_user.get("user_exists")) and key_installed is True,
+                    "matching_key_count": matching_keys,
+                    "error": server_result.get("error") or remote_user.get("error"),
+                }
+            )
+
+    return matrix
 
 
 def parse_gpu_query(output):
@@ -345,6 +525,11 @@ def get_servers():
     return jsonify(
         {"servers": servers, "refresh_interval": config.get("refresh_interval", 5)}
     )
+
+
+@app.route("/api/access-matrix")
+def get_access_matrix():
+    return jsonify(build_access_matrix())
 
 
 if __name__ == "__main__":
