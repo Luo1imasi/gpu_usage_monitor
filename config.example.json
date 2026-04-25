@@ -1,4 +1,5 @@
 {
+  "admin_token": "change-me",
   "servers": [
     {
       "name": "Server 1",

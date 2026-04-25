@@ -13,11 +13,6 @@ from flask import Flask, render_template, jsonify, request
 from pathlib import Path
 import paramiko
 
-try:
-    from config import ADMIN_TOKEN as config_admin_token
-except ImportError:
-    config_admin_token = ""
-
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -27,7 +22,6 @@ app = Flask(__name__)
 CONFIG_PATH = Path(__file__).parent / "config.json"
 USER_FILE_PATH = Path(__file__).parent / "user.txt"
 USERNAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
-ADMIN_TOKEN_ENV = "GPU_MONITOR_ADMIN_TOKEN"
 
 cached_data = []
 last_update = None
@@ -471,7 +465,7 @@ def configure_access_pairs(pairs):
 
 
 def is_admin_authorized():
-    expected_token = os.environ.get(ADMIN_TOKEN_ENV) or config_admin_token
+    expected_token = load_config().get("admin_token", "")
     if not expected_token:
         return False
     supplied_token = request.headers.get("X-Admin-Token", "")
