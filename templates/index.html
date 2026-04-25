@@ -49,7 +49,7 @@
         
         .servers {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+            grid-template-columns: repeat(2, minmax(0, 1fr));
             gap: 16px;
             align-items: start;
         }
@@ -64,11 +64,18 @@
         }
 
         .access-tools {
-            display: grid;
-            grid-template-columns: minmax(280px, 0.95fr) minmax(420px, 1.35fr);
-            gap: 12px;
             margin-bottom: 12px;
+        }
+
+        .access-tools,
+        .access-section-tools {
+            display: grid;
+            gap: 12px;
             align-items: stretch;
+        }
+
+        .access-section-tools {
+            padding: 12px 12px 0;
         }
 
         .access-tool-card {
@@ -191,7 +198,7 @@
 
         .user-add-form {
             display: grid;
-            grid-template-columns: minmax(120px, 160px) minmax(240px, 1fr) minmax(150px, 190px) auto;
+            grid-template-columns: minmax(160px, 0.45fr) minmax(260px, 1fr) auto;
             gap: 8px;
             align-items: start;
         }
@@ -261,6 +268,7 @@
             .user-add-form {
                 grid-template-columns: 1fr;
             }
+
         }
 
         .access-result {
@@ -456,13 +464,8 @@
         }
 
         @media (max-width: 980px) {
+            .servers,
             .gpu-list {
-                grid-template-columns: 1fr;
-            }
-        }
-
-        @media (max-width: 1100px) {
-            .access-tools {
                 grid-template-columns: 1fr;
             }
         }
@@ -611,22 +614,6 @@
                         <span class="access-result ssh-key-result" id="ssh-key-result"></span>
                     </div>
                 </div>
-                <div class="access-tool-card">
-                    <div class="access-tool-card-header">
-                        <div>
-                            <div class="access-tool-title">添加访问用户</div>
-                            <div class="access-tool-desc">录入用户名、SSH Key 和管理 Token，保存后会自动刷新权限矩阵。</div>
-                        </div>
-                        <span class="access-shortcut">Ctrl/⌘ + Enter</span>
-                    </div>
-                    <div class="user-add-form">
-                        <input class="user-add-input" id="add-user-name" type="text" placeholder="用户名，例如 alice" autocomplete="off">
-                        <textarea class="user-add-input user-add-key" id="add-user-key" rows="2" placeholder="ssh-ed25519 AAAA... alice@example"></textarea>
-                        <input class="user-add-input" id="add-user-token" type="password" placeholder="管理 Token" autocomplete="off">
-                        <button id="add-user" type="button">添加用户</button>
-                        <span class="access-result user-add-result" id="add-user-result"></span>
-                    </div>
-                </div>
             </div>
             <details class="access-section" id="access-section">
                 <summary>
@@ -638,6 +625,23 @@
                         </div>
                     </div>
                 </summary>
+                <div class="access-section-tools">
+                    <div class="access-tool-card">
+                        <div class="access-tool-card-header">
+                            <div>
+                                <div class="access-tool-title">添加访问用户</div>
+                                <div class="access-tool-desc">录入用户名和 SSH Key；点击添加时输入管理 Token，保存后会自动刷新权限矩阵。</div>
+                            </div>
+                            <span class="access-shortcut">Ctrl/⌘ + Enter</span>
+                        </div>
+                        <div class="user-add-form">
+                            <input class="user-add-input" id="add-user-name" type="text" placeholder="用户名，例如 alice" autocomplete="off">
+                            <textarea class="user-add-input user-add-key" id="add-user-key" rows="2" placeholder="ssh-ed25519 AAAA... alice@example"></textarea>
+                            <button id="add-user" type="button">添加用户</button>
+                            <span class="access-result user-add-result" id="add-user-result"></span>
+                        </div>
+                    </div>
+                </div>
                 <div class="access-actions">
                     <button id="configure-access" type="button">为选中用户配置选中服务器</button>
                     <button id="select-missing-access" type="button">选择缺失权限</button>
@@ -704,7 +708,7 @@
                     checkSshKeyExists();
                 }
             });
-            ['add-user-name', 'add-user-key', 'add-user-token'].forEach(id => {
+            ['add-user-name', 'add-user-key'].forEach(id => {
                 document.getElementById(id).addEventListener('keydown', event => {
                     if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
                         event.preventDefault();
@@ -1026,10 +1030,8 @@
             const button = document.getElementById('add-user');
             const usernameInput = document.getElementById('add-user-name');
             const keyInput = document.getElementById('add-user-key');
-            const tokenInput = document.getElementById('add-user-token');
             const username = usernameInput.value.trim();
             const sshKey = keyInput.value.trim();
-            const token = tokenInput.value.trim();
 
             if (!username) {
                 setAddUserResult('请填写用户名', 'error');
@@ -1039,8 +1041,10 @@
                 setAddUserResult('请粘贴 SSH public key', 'error');
                 return;
             }
+
+            const token = window.prompt('请输入管理 Token');
             if (!token) {
-                setAddUserResult('请填写管理 Token', 'error');
+                setAddUserResult('已取消添加：缺少管理 Token', 'error');
                 return;
             }
 
