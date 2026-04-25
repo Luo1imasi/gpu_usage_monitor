@@ -1,0 +1,34 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Flask/runtime files
+instance/
+*.log
+
+# Local runtime configuration and private data.
+# Commit config.example.json instead of config.json.
+config.json
+config.py
+user.txt
+
+# Editor/OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
