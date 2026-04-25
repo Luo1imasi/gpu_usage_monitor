@@ -1,4 +1,6 @@
 import csv
+import base64
+import binascii
 import hashlib
 import io
 import json
@@ -22,6 +24,15 @@ app = Flask(__name__)
 CONFIG_PATH = Path(__file__).parent / "config.json"
 USER_FILE_PATH = Path(__file__).parent / "user.txt"
 USERNAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
+MAX_SSH_KEY_INPUT_SIZE = 16 * 1024
+SSH_KEY_TYPES = {
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+}
+user_file_lock = threading.Lock()
 
 cached_data = []
 last_update = None
@@ -171,6 +182,112 @@ def normalize_ssh_key(key):
 def key_fingerprint(key):
     normalized = normalize_ssh_key(key)
     return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def ssh_key_identity(key):
+    parts = normalize_ssh_key(key).split()
+    if len(parts) < 2:
+        return None
+    return " ".join(parts[:2])
+
+
+def parse_ssh_public_key(key):
+    parts = normalize_ssh_key(key).split()
+    if len(parts) < 2:
+        return None
+    key_type, key_body = parts[0], parts[1]
+    if key_type not in SSH_KEY_TYPES:
+        return None
+    try:
+        decoded = base64.b64decode(key_body.encode(), validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    if len(decoded) < 4:
+        return None
+
+    type_length = int.from_bytes(decoded[:4], "big")
+    if type_length <= 0 or type_length > len(decoded) - 4:
+        return None
+    try:
+        embedded_type = decoded[4 : 4 + type_length].decode()
+    except UnicodeDecodeError:
+        return None
+    if embedded_type != key_type:
+        return None
+    return {"key_type": key_type, "key_body": key_body}
+
+
+def is_valid_ssh_public_key(key):
+    return parse_ssh_public_key(key) is not None
+
+
+def find_ssh_key_matches(ssh_key):
+    normalized_key = normalize_ssh_key(ssh_key)
+    if not is_valid_ssh_public_key(normalized_key):
+        return None
+    identity = ssh_key_identity(normalized_key)
+
+    exact_fingerprint = key_fingerprint(normalized_key)
+    identity_fingerprint = key_fingerprint(identity)
+    matches = []
+
+    for user in load_user_keys():
+        exact_match = exact_fingerprint in user["key_hashes"]
+        identity_match = False
+        for stored_key in user["ssh_keys"]:
+            stored_identity = ssh_key_identity(stored_key)
+            if stored_identity and key_fingerprint(stored_identity) == identity_fingerprint:
+                identity_match = True
+                break
+        if exact_match or identity_match:
+            matches.append(
+                {
+                    "username": user["username"],
+                    "key_count": len(user["key_hashes"]),
+                    "match_type": "exact" if exact_match else "key_body",
+                }
+            )
+
+    return {
+        "exists": len(matches) > 0,
+        "matches": matches,
+    }
+
+
+def add_user_key(username, ssh_key):
+    if not isinstance(username, str) or not USERNAME_PATTERN.match(username):
+        return {"error": "invalid_username"}, 400
+    if not isinstance(ssh_key, str) or not normalize_ssh_key(ssh_key):
+        return {"error": "ssh_key_required"}, 400
+    if len(ssh_key) > MAX_SSH_KEY_INPUT_SIZE:
+        return {"error": "invalid_ssh_key"}, 400
+
+    normalized_key = normalize_ssh_key(ssh_key)
+    if not is_valid_ssh_public_key(normalized_key):
+        return {"error": "invalid_ssh_key"}, 400
+
+    with user_file_lock:
+        existing = find_ssh_key_matches(normalized_key)
+        if existing and existing["exists"]:
+            return {"error": "ssh_key_already_exists", "matches": existing["matches"]}, 409
+
+        USER_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        needs_newline = False
+        try:
+            with open(USER_FILE_PATH, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                if f.tell() > 0:
+                    f.seek(-1, os.SEEK_END)
+                    needs_newline = f.read(1) != b"\n"
+        except FileNotFoundError:
+            pass
+
+        with open(USER_FILE_PATH, "a") as f:
+            if needs_newline:
+                f.write("\n")
+            f.write(f"{username} {normalized_key}\n")
+
+    return {"username": username, "key_added": True}, 200
 
 
 def load_user_keys():
@@ -794,6 +911,33 @@ def get_servers():
 @app.route("/api/access-matrix")
 def get_access_matrix():
     return jsonify(build_access_matrix())
+
+
+@app.route("/api/check-ssh-key", methods=["POST"])
+def check_ssh_key():
+    payload = request.get_json(silent=True) or {}
+    ssh_key = payload.get("ssh_key", "")
+    if not isinstance(ssh_key, str) or not normalize_ssh_key(ssh_key):
+        return jsonify({"error": "ssh_key_required"}), 400
+    if len(ssh_key) > MAX_SSH_KEY_INPUT_SIZE:
+        return jsonify({"error": "invalid_ssh_key"}), 400
+
+    result = find_ssh_key_matches(ssh_key)
+    if result is None:
+        return jsonify({"error": "invalid_ssh_key"}), 400
+    return jsonify(result)
+
+
+@app.route("/api/users", methods=["POST"])
+def add_user():
+    if not is_admin_authorized():
+        return jsonify({"error": "admin_token_required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    username = payload.get("username", "")
+    ssh_key = payload.get("ssh_key", "")
+    result, status_code = add_user_key(username, ssh_key)
+    return jsonify(result), status_code
 
 
 @app.route("/api/configure-access", methods=["POST"])
