@@ -24,6 +24,7 @@ app = Flask(__name__)
 CONFIG_PATH = Path(__file__).parent / "config.json"
 USER_FILE_PATH = Path(__file__).parent / "user.txt"
 USERNAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
+MIN_MANAGED_UID = 1000
 MAX_SSH_KEY_INPUT_SIZE = 16 * 1024
 SSH_KEY_TYPES = {
     "ssh-ed25519",
@@ -32,7 +33,9 @@ SSH_KEY_TYPES = {
     "ecdsa-sha2-nistp384",
     "ecdsa-sha2-nistp521",
 }
-user_file_lock = threading.Lock()
+SYSTEM_SHELL_NAMES = {"false", "nologin", "sync", "halt", "shutdown"}
+PROTECTED_USERNAMES = {"root"}
+user_file_lock = threading.RLock()
 
 cached_data = []
 last_update = None
@@ -221,6 +224,22 @@ def is_valid_ssh_public_key(key):
     return parse_ssh_public_key(key) is not None
 
 
+def validate_username(username):
+    return isinstance(username, str) and USERNAME_PATTERN.match(username) is not None
+
+
+def validate_ssh_key_input(ssh_key):
+    if not isinstance(ssh_key, str) or not normalize_ssh_key(ssh_key):
+        return None, "ssh_key_required"
+    if len(ssh_key) > MAX_SSH_KEY_INPUT_SIZE:
+        return None, "invalid_ssh_key"
+
+    normalized_key = normalize_ssh_key(ssh_key)
+    if not is_valid_ssh_public_key(normalized_key):
+        return None, "invalid_ssh_key"
+    return normalized_key, None
+
+
 def find_ssh_key_matches(ssh_key):
     normalized_key = normalize_ssh_key(ssh_key)
     if not is_valid_ssh_public_key(normalized_key):
@@ -254,70 +273,103 @@ def find_ssh_key_matches(ssh_key):
     }
 
 
-def add_user_key(username, ssh_key):
-    if not isinstance(username, str) or not USERNAME_PATTERN.match(username):
-        return {"error": "invalid_username"}, 400
-    if not isinstance(ssh_key, str) or not normalize_ssh_key(ssh_key):
-        return {"error": "ssh_key_required"}, 400
-    if len(ssh_key) > MAX_SSH_KEY_INPUT_SIZE:
-        return {"error": "invalid_ssh_key"}, 400
+def append_user_key_unlocked(username, normalized_key):
+    USER_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    needs_newline = False
+    try:
+        with open(USER_FILE_PATH, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell() > 0:
+                f.seek(-1, os.SEEK_END)
+                needs_newline = f.read(1) != b"\n"
+    except FileNotFoundError:
+        pass
 
-    normalized_key = normalize_ssh_key(ssh_key)
-    if not is_valid_ssh_public_key(normalized_key):
-        return {"error": "invalid_ssh_key"}, 400
+    with open(USER_FILE_PATH, "a") as f:
+        if needs_newline:
+            f.write("\n")
+        f.write(f"{username} {normalized_key}\n")
+
+
+def remove_user_from_file(username):
+    if not validate_username(username):
+        return {"error": "invalid_username"}, 400
+
+    with user_file_lock:
+        try:
+            with open(USER_FILE_PATH) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return {"username": username, "removed_lines": 0}, 200
+
+        kept_lines = []
+        removed_lines = 0
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                kept_lines.append(line)
+                continue
+            parts = stripped.split(None, 1)
+            if len(parts) == 2 and parts[0] == username:
+                removed_lines += 1
+                continue
+            kept_lines.append(line)
+
+        tmp_path = USER_FILE_PATH.with_suffix(USER_FILE_PATH.suffix + ".tmp")
+        with open(tmp_path, "w") as f:
+            f.writelines(kept_lines)
+        os.replace(tmp_path, USER_FILE_PATH)
+
+    return {"username": username, "removed_lines": removed_lines}, 200
+
+
+def add_user_key(username, ssh_key):
+    if not validate_username(username):
+        return {"error": "invalid_username"}, 400
+
+    normalized_key, error = validate_ssh_key_input(ssh_key)
+    if error:
+        return {"error": error}, 400
 
     with user_file_lock:
         existing = find_ssh_key_matches(normalized_key)
         if existing and existing["exists"]:
             return {"error": "ssh_key_already_exists", "matches": existing["matches"]}, 409
 
-        USER_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        needs_newline = False
-        try:
-            with open(USER_FILE_PATH, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                if f.tell() > 0:
-                    f.seek(-1, os.SEEK_END)
-                    needs_newline = f.read(1) != b"\n"
-        except FileNotFoundError:
-            pass
-
-        with open(USER_FILE_PATH, "a") as f:
-            if needs_newline:
-                f.write("\n")
-            f.write(f"{username} {normalized_key}\n")
+        append_user_key_unlocked(username, normalized_key)
 
     return {"username": username, "key_added": True}, 200
 
 
 def load_user_keys():
     users = {}
-    try:
-        with open(USER_FILE_PATH) as f:
-            for line_no, line in enumerate(f, start=1):
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                parts = stripped.split(None, 1)
-                if len(parts) != 2:
-                    logger.warning(f"Invalid user line {line_no} in {USER_FILE_PATH}")
-                    continue
-                username, ssh_key = parts
-                if not USERNAME_PATTERN.match(username):
-                    logger.warning(f"Invalid username {username} in {USER_FILE_PATH}")
-                    continue
-                fingerprint = key_fingerprint(ssh_key)
-                if username not in users:
-                    users[username] = {
-                        "username": username,
-                        "key_hashes": set(),
-                        "ssh_keys": [],
-                    }
-                users[username]["key_hashes"].add(fingerprint)
-                if ssh_key not in users[username]["ssh_keys"]:
-                    users[username]["ssh_keys"].append(ssh_key)
-    except FileNotFoundError:
-        logger.error(f"User file not found: {USER_FILE_PATH}")
+    with user_file_lock:
+        try:
+            with open(USER_FILE_PATH) as f:
+                for line_no, line in enumerate(f, start=1):
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    parts = stripped.split(None, 1)
+                    if len(parts) != 2:
+                        logger.warning(f"Invalid user line {line_no} in {USER_FILE_PATH}")
+                        continue
+                    username, ssh_key = parts
+                    if not USERNAME_PATTERN.match(username):
+                        logger.warning(f"Invalid username {username} in {USER_FILE_PATH}")
+                        continue
+                    fingerprint = key_fingerprint(ssh_key)
+                    if username not in users:
+                        users[username] = {
+                            "username": username,
+                            "key_hashes": set(),
+                            "ssh_keys": [],
+                        }
+                    users[username]["key_hashes"].add(fingerprint)
+                    if ssh_key not in users[username]["ssh_keys"]:
+                        users[username]["ssh_keys"].append(ssh_key)
+        except FileNotFoundError:
+            logger.error(f"User file not found: {USER_FILE_PATH}")
 
     return [
         {
@@ -327,6 +379,110 @@ def load_user_keys():
         }
         for user in sorted(users.values(), key=lambda item: item["username"])
     ]
+
+
+def build_local_key_index(users=None):
+    users = users if users is not None else load_user_keys()
+    exact = {}
+    identity = {}
+    for user in users:
+        for ssh_key in user["ssh_keys"]:
+            exact.setdefault(key_fingerprint(ssh_key), set()).add(user["username"])
+            key_identity = ssh_key_identity(ssh_key)
+            if key_identity:
+                identity.setdefault(key_fingerprint(key_identity), set()).add(user["username"])
+    return exact, identity
+
+
+def annotate_discovered_users(results):
+    local_users = load_user_keys()
+    local_usernames = {user["username"] for user in local_users}
+    exact_index, identity_index = build_local_key_index(local_users)
+
+    for server_result in results:
+        for user in server_result.get("users", []):
+            user["in_user_file"] = user["username"] in local_usernames
+            new_keys = []
+            duplicate_keys = []
+            invalid_keys = []
+            for ssh_key in user.get("ssh_keys", []):
+                normalized_key = normalize_ssh_key(ssh_key)
+                if not is_valid_ssh_public_key(normalized_key):
+                    invalid_keys.append(normalized_key)
+                    continue
+                identity = ssh_key_identity(normalized_key)
+                duplicate_users = set(exact_index.get(key_fingerprint(normalized_key), set()))
+                if identity:
+                    duplicate_users.update(identity_index.get(key_fingerprint(identity), set()))
+                if duplicate_users:
+                    duplicate_keys.append(
+                        {
+                            "ssh_key": normalized_key,
+                            "users": sorted(duplicate_users),
+                        }
+                    )
+                else:
+                    new_keys.append(normalized_key)
+            user["new_keys"] = new_keys
+            user["duplicate_keys"] = duplicate_keys
+            user["invalid_keys"] = invalid_keys
+            user["key_count"] = len(user.get("ssh_keys", []))
+    return results
+
+
+def import_user_keys(items):
+    if not isinstance(items, list) or not items:
+        return {"error": "select_at_least_one_user_key"}, 400
+
+    imported = []
+    skipped = []
+    errors = []
+
+    with user_file_lock:
+        seen_request_keys = set()
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                errors.append({"index": index, "error": "items_must_be_objects"})
+                continue
+
+            username = item.get("username", "")
+            if not validate_username(username):
+                errors.append({"index": index, "username": username, "error": "invalid_username"})
+                continue
+
+            normalized_key, error = validate_ssh_key_input(item.get("ssh_key", ""))
+            if error:
+                errors.append({"index": index, "username": username, "error": error})
+                continue
+
+            identity = ssh_key_identity(normalized_key) or normalized_key
+            request_key = key_fingerprint(identity)
+            if request_key in seen_request_keys:
+                skipped.append({"index": index, "username": username, "reason": "duplicate_in_request"})
+                continue
+            seen_request_keys.add(request_key)
+
+            existing = find_ssh_key_matches(normalized_key)
+            if existing and existing["exists"]:
+                skipped.append(
+                    {
+                        "index": index,
+                        "username": username,
+                        "reason": "ssh_key_already_exists",
+                        "matches": existing["matches"],
+                    }
+                )
+                continue
+
+            append_user_key_unlocked(username, normalized_key)
+            imported.append({"username": username})
+
+    return {
+        "error": None,
+        "imported": imported,
+        "skipped": skipped,
+        "errors": errors,
+    }, 200
 
 
 def get_servers_by_name():
@@ -430,7 +586,7 @@ for item in users:
 
         os.makedirs(ssh_dir, exist_ok=True)
         os.chmod(ssh_dir, 0o700)
-        shutil.chown(ssh_dir, user=username, group=username)
+        shutil.chown(ssh_dir, user=username, group=entry.pw_gid)
 
         if admin_group:
             groups_proc = run(["id", "-nG", username])
@@ -469,7 +625,7 @@ for item in users:
                 result["keys_added"] += 1
 
         os.chmod(auth_keys, 0o600)
-        shutil.chown(auth_keys, user=username, group=username)
+        shutil.chown(auth_keys, user=username, group=entry.pw_gid)
     except Exception as exc:
         result["errors"].append(exc.__class__.__name__)
 
@@ -579,6 +735,341 @@ def configure_access_pairs(pairs):
 
     results.sort(key=lambda item: item["server"])
     return {"error": None, "results": results}, 200
+
+
+def configured_ssh_usernames():
+    return {
+        server.get("username")
+        for server in get_configured_servers()
+        if isinstance(server.get("username"), str)
+    }
+
+
+def is_protected_username(username):
+    return username in PROTECTED_USERNAMES or username in configured_ssh_usernames()
+
+
+def resolve_selected_servers(server_names, allow_empty=False):
+    servers_by_name = get_servers_by_name()
+    if server_names is None and allow_empty:
+        return [], None
+    if server_names is None:
+        return get_configured_servers(), None
+    if not isinstance(server_names, list):
+        return None, {"error": "servers_must_be_a_list"}
+
+    clean_names = [name for name in server_names if isinstance(name, str)]
+    unknown_servers = sorted(set(clean_names) - set(servers_by_name))
+    if unknown_servers:
+        return None, {"error": "invalid_selection", "unknown_servers": unknown_servers}
+    return [servers_by_name[name] for name in clean_names], None
+
+
+def build_detect_users_command(use_sudo=True):
+    runner = "sudo -n python3 -" if use_sudo else "python3 -"
+    script = f"""
+import json
+import os
+import pwd
+
+min_uid = {MIN_MANAGED_UID}
+system_shell_names = {json.dumps(sorted(SYSTEM_SHELL_NAMES))}
+results = []
+
+for entry in pwd.getpwall():
+    shell_name = os.path.basename(entry.pw_shell or "")
+    if entry.pw_uid < min_uid or shell_name in system_shell_names:
+        continue
+
+    item = {{
+        "username": entry.pw_name,
+        "uid": entry.pw_uid,
+        "gid": entry.pw_gid,
+        "home": entry.pw_dir,
+        "shell": entry.pw_shell,
+        "authorized_keys_readable": False,
+        "ssh_keys": [],
+        "error": None,
+    }}
+
+    auth_keys = os.path.join(entry.pw_dir, ".ssh", "authorized_keys")
+    try:
+        with open(auth_keys) as f:
+            for line in f:
+                normalized = " ".join(line.strip().split())
+                if normalized and not normalized.startswith("#"):
+                    item["ssh_keys"].append(normalized)
+        item["authorized_keys_readable"] = True
+    except FileNotFoundError:
+        item["authorized_keys_readable"] = True
+    except PermissionError:
+        item["error"] = "permission_denied"
+    except OSError as exc:
+        item["error"] = exc.__class__.__name__
+
+    results.append(item)
+
+print(json.dumps(results, ensure_ascii=False))
+"""
+    return f"{runner} <<'PY'\n{script}\nPY"
+
+
+def detect_users_for_server(server):
+    try:
+        client = get_ssh_client(server)
+        status, out, err = run_ssh_command_status(
+            client, build_detect_users_command(use_sudo=True), timeout=45
+        )
+        if status != 0:
+            status, out, err = run_ssh_command_status(
+                client, build_detect_users_command(use_sudo=False), timeout=45
+            )
+        if status != 0:
+            message = err.strip() or out.strip() or "detect users command failed"
+            return {"server": server["name"], "error": sanitize_error(message), "users": []}
+
+        users = json.loads(out)
+        users = [
+            user for user in users
+            if validate_username(user.get("username", ""))
+        ]
+        users.sort(key=lambda item: item["username"])
+        return {"server": server["name"], "error": None, "users": users}
+    except Exception as e:
+        logger.error(f"Error detecting users for {server['name']}: {e}")
+        invalidate_ssh_client(server)
+        return {"server": server["name"], "error": sanitize_error(str(e)), "users": []}
+
+
+def detect_server_users(server_names=None):
+    selected_servers, error = resolve_selected_servers(server_names)
+    if error:
+        return {**error, "results": []}, 400
+
+    futures = {
+        executor.submit(detect_users_for_server, server): server
+        for server in selected_servers
+    }
+    results = []
+    for future in as_completed(futures):
+        server = futures[future]
+        try:
+            results.append(future.result())
+        except Exception as e:
+            logger.error(f"Unexpected detect error for {server['name']}: {e}")
+            results.append({"server": server["name"], "error": sanitize_error(str(e)), "users": []})
+
+    results.sort(key=lambda item: item["server"])
+    return {"error": None, "results": annotate_discovered_users(results)}, 200
+
+
+def build_revoke_user_command(username, ssh_keys, mode, clear_authorized_keys, remove_home):
+    normalized_keys = [normalize_ssh_key(key) for key in ssh_keys if normalize_ssh_key(key)]
+    script = f"""
+import json
+import os
+import pwd
+import shutil
+import subprocess
+
+username = {json.dumps(username)}
+ssh_keys = set({json.dumps(normalized_keys)})
+mode = {json.dumps(mode)}
+clear_authorized_keys = {repr(bool(clear_authorized_keys))}
+remove_home = {repr(bool(remove_home))}
+admin_groups = ["sudo", "wheel"]
+
+def run(args):
+    return subprocess.run(args, check=False, capture_output=True, text=True)
+
+result = {{
+    "user_exists": False,
+    "uid": None,
+    "keys_removed": 0,
+    "authorized_keys_cleared": False,
+    "sudoers_removed": False,
+    "admin_groups_removed": [],
+    "password_locked": False,
+    "deleted": False,
+    "errors": [],
+}}
+
+try:
+    entry = pwd.getpwnam(username)
+    result["user_exists"] = True
+    result["uid"] = entry.pw_uid
+except KeyError:
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+
+if result["uid"] is not None and result["uid"] < {MIN_MANAGED_UID}:
+    result["errors"].append("refuse_system_user")
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+
+auth_keys = os.path.join(entry.pw_dir, ".ssh", "authorized_keys")
+try:
+    if os.path.exists(auth_keys):
+        if clear_authorized_keys:
+            existing = []
+            with open(auth_keys) as f:
+                existing = [line for line in f if line.strip()]
+            with open(auth_keys, "w"):
+                pass
+            result["keys_removed"] = len(existing)
+            result["authorized_keys_cleared"] = True
+        else:
+            kept = []
+            removed = 0
+            with open(auth_keys) as f:
+                for line in f:
+                    normalized = " ".join(line.strip().split())
+                    if normalized and normalized in ssh_keys:
+                        removed += 1
+                        continue
+                    kept.append(line)
+            with open(auth_keys, "w") as f:
+                f.writelines(kept)
+            result["keys_removed"] = removed
+        os.chmod(auth_keys, 0o600)
+        shutil.chown(auth_keys, user=username, group=entry.pw_gid)
+except Exception as exc:
+    result["errors"].append("authorized_keys_" + exc.__class__.__name__)
+
+sudoers_file = os.path.join("/etc/sudoers.d", username)
+try:
+    if os.path.exists(sudoers_file):
+        os.remove(sudoers_file)
+        result["sudoers_removed"] = True
+except Exception as exc:
+    result["errors"].append("sudoers_" + exc.__class__.__name__)
+
+for group_name in admin_groups:
+    proc = run(["getent", "group", group_name])
+    if proc.returncode != 0:
+        continue
+    groups_proc = run(["id", "-nG", username])
+    if group_name in groups_proc.stdout.split():
+        remove_proc = run(["gpasswd", "-d", username, group_name])
+        if remove_proc.returncode == 0:
+            result["admin_groups_removed"].append(group_name)
+        else:
+            result["errors"].append(remove_proc.stderr.strip() or "group_remove_failed")
+
+lock_proc = run(["passwd", "-l", username])
+if lock_proc.returncode == 0:
+    result["password_locked"] = True
+else:
+    result["errors"].append(lock_proc.stderr.strip() or "passwd_lock_failed")
+
+if mode == "delete_account":
+    args = ["userdel"]
+    if remove_home:
+        args.append("-r")
+    args.append(username)
+    proc = run(args)
+    if proc.returncode == 0:
+        result["deleted"] = True
+    else:
+        result["errors"].append(proc.stderr.strip() or "userdel_failed")
+
+print(json.dumps(result, ensure_ascii=False))
+"""
+    return f"sudo -n python3 - <<'PY'\n{script}\nPY"
+
+
+def revoke_user_on_server(server, username, ssh_keys, mode, clear_authorized_keys, remove_home):
+    try:
+        client = get_ssh_client(server)
+        status, out, err = run_ssh_command_status(
+            client,
+            build_revoke_user_command(username, ssh_keys, mode, clear_authorized_keys, remove_home),
+            timeout=120,
+        )
+        if status != 0:
+            message = err.strip() or out.strip() or "revoke user command failed"
+            return {"server": server["name"], "error": sanitize_error(message), "result": {}}
+        return {"server": server["name"], "error": None, "result": json.loads(out)}
+    except Exception as e:
+        logger.error(f"Error revoking user {username} for {server['name']}: {e}")
+        invalidate_ssh_client(server)
+        return {"server": server["name"], "error": sanitize_error(str(e)), "result": {}}
+
+
+def remote_user_change_has_errors(results):
+    for server_result in results:
+        if server_result.get("error"):
+            return True
+        user_result = server_result.get("result") or {}
+        if user_result.get("errors"):
+            return True
+    return False
+
+
+def delete_user_access(username, payload):
+    if not validate_username(username):
+        return {"error": "invalid_username", "results": []}, 400
+    if is_protected_username(username):
+        return {"error": "protected_username", "results": []}, 400
+
+    mode = payload.get("mode", "revoke")
+    if mode not in {"local_only", "revoke", "delete_account"}:
+        return {"error": "invalid_delete_mode", "results": []}, 400
+    if mode == "delete_account" and payload.get("confirm") != username:
+        return {"error": "username_confirmation_required", "results": []}, 400
+
+    users_by_name = get_users_by_name()
+    user = users_by_name.get(username, {"ssh_keys": []})
+
+    if mode == "local_only":
+        local_result, _ = remove_user_from_file(username)
+        return {"error": None, "local": local_result, "results": []}, 200
+
+    selected_servers, error = resolve_selected_servers(payload.get("servers"), allow_empty=True)
+    if error:
+        return {**error, "results": []}, 400
+    if not selected_servers:
+        return {"error": "select_at_least_one_server", "results": []}, 400
+
+    clear_authorized_keys = bool(payload.get("clear_authorized_keys", True))
+    remove_home = bool(payload.get("remove_home", False))
+    remove_from_user_file = bool(payload.get("remove_from_user_file", True))
+
+    futures = {
+        executor.submit(
+            revoke_user_on_server,
+            server,
+            username,
+            user.get("ssh_keys", []),
+            mode,
+            clear_authorized_keys,
+            remove_home,
+        ): server
+        for server in selected_servers
+    }
+    results = []
+    for future in as_completed(futures):
+        server = futures[future]
+        try:
+            results.append(future.result())
+        except Exception as e:
+            logger.error(f"Unexpected delete error for {server['name']}: {e}")
+            results.append({"server": server["name"], "error": sanitize_error(str(e)), "result": {}})
+
+    results.sort(key=lambda item: item["server"])
+    local_result = None
+    if remove_from_user_file:
+        if remote_user_change_has_errors(results):
+            local_result = {
+                "username": username,
+                "removed_lines": 0,
+                "skipped": True,
+                "reason": "remote_errors",
+            }
+        else:
+            local_result, _ = remove_user_from_file(username)
+
+    return {"error": None, "local": local_result, "results": results}, 200
 
 
 def is_admin_authorized():
@@ -915,6 +1406,9 @@ def get_access_matrix():
 
 @app.route("/api/check-ssh-key", methods=["POST"])
 def check_ssh_key():
+    if not is_admin_authorized():
+        return jsonify({"error": "admin_token_required"}), 403
+
     payload = request.get_json(silent=True) or {}
     ssh_key = payload.get("ssh_key", "")
     if not isinstance(ssh_key, str) or not normalize_ssh_key(ssh_key):
@@ -937,6 +1431,36 @@ def add_user():
     username = payload.get("username", "")
     ssh_key = payload.get("ssh_key", "")
     result, status_code = add_user_key(username, ssh_key)
+    return jsonify(result), status_code
+
+
+@app.route("/api/detect-users", methods=["POST"])
+def detect_users():
+    if not is_admin_authorized():
+        return jsonify({"error": "admin_token_required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    result, status_code = detect_server_users(payload.get("servers"))
+    return jsonify(result), status_code
+
+
+@app.route("/api/import-users", methods=["POST"])
+def import_users():
+    if not is_admin_authorized():
+        return jsonify({"error": "admin_token_required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    result, status_code = import_user_keys(payload.get("items"))
+    return jsonify(result), status_code
+
+
+@app.route("/api/users/<username>", methods=["DELETE"])
+def delete_user(username):
+    if not is_admin_authorized():
+        return jsonify({"error": "admin_token_required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    result, status_code = delete_user_access(username, payload)
     return jsonify(result), status_code
 
 
