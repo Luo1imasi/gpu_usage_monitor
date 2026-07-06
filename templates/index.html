@@ -1142,6 +1142,7 @@
             let errorCount = 0;
             let removedKeys = 0;
             let deletedAccounts = 0;
+            let processCount = 0;
             results.forEach(server => {
                 if (server.error) {
                     errorCount++;
@@ -1149,6 +1150,7 @@
                 }
                 const result = server.result || {};
                 removedKeys += result.keys_removed || 0;
+                processCount += result.processes_found || 0;
                 if (result.deleted) {
                     deletedAccounts++;
                 }
@@ -1157,7 +1159,8 @@
             const localRemoved = data && data.local ? data.local.removed_lines || 0 : 0;
             const localText = data && data.local && data.local.skipped ? '本地保留' : '本地移除 ' + localRemoved + ' 行';
             const accountText = deletedAccounts > 0 ? '，删除账号 ' + deletedAccounts + ' 个' : '';
-            return '完成 ' + serverCount + ' 台服务器撤权，远端移除 ' + removedKeys + ' 个 Key' + accountText + '，' + localText + '，错误 ' + errorCount + ' 个';
+            const processText = processCount > 0 ? '，终止进程 ' + processCount + ' 个' : '';
+            return '完成 ' + serverCount + ' 台服务器撤权，远端移除 ' + removedKeys + ' 个 Key' + accountText + processText + '，' + localText + '，错误 ' + errorCount + ' 个';
         }
 
         function collectDeleteErrors(data) {
@@ -1545,7 +1548,7 @@
                 return;
             }
 
-            const confirmText = window.prompt('将删除远端账号和 home 目录。请输入用户名确认：' + username);
+            const confirmText = window.prompt('将终止该用户进程，并删除远端账号和 home 目录。请输入用户名确认：' + username);
             if (confirmText !== username) {
                 setAccessResult('已取消删除账号：用户名确认不匹配', true);
                 return;

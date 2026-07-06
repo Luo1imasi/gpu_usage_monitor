@@ -870,7 +870,9 @@ import json
 import os
 import pwd
 import shutil
+import signal
 import subprocess
+import time
 
 username = {json.dumps(username)}
 ssh_keys = set({json.dumps(normalized_keys)})
@@ -890,9 +892,68 @@ result = {{
     "sudoers_removed": False,
     "admin_groups_removed": [],
     "password_locked": False,
+    "processes_found": 0,
+    "processes_terminated": 0,
+    "processes_killed": 0,
+    "processes_remaining": [],
     "deleted": False,
     "errors": [],
 }}
+
+def list_user_pids(uid):
+    pids = []
+    self_pid = os.getpid()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == self_pid:
+            continue
+        try:
+            if os.stat(os.path.join("/proc", name)).st_uid == uid:
+                pids.append(pid)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+    return sorted(pids)
+
+def wait_for_user_process_exit(uid, timeout):
+    deadline = time.time() + timeout
+    remaining = list_user_pids(uid)
+    while remaining and time.time() < deadline:
+        time.sleep(0.2)
+        remaining = list_user_pids(uid)
+    return remaining
+
+def signal_user_processes(uid, sig):
+    signaled = 0
+    for pid in list_user_pids(uid):
+        try:
+            os.kill(pid, sig)
+            signaled += 1
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+        except OSError:
+            continue
+    return signaled
+
+def terminate_user_processes(uid):
+    initial_pids = list_user_pids(uid)
+    result["processes_found"] = len(initial_pids)
+    if not initial_pids:
+        return []
+
+    result["processes_terminated"] = signal_user_processes(uid, signal.SIGTERM)
+    remaining = wait_for_user_process_exit(uid, 5)
+    if remaining:
+        result["processes_killed"] = signal_user_processes(uid, signal.SIGKILL)
+        remaining = wait_for_user_process_exit(uid, 3)
+
+    result["processes_remaining"] = remaining
+    return remaining
 
 try:
     entry = pwd.getpwnam(username)
@@ -963,6 +1024,10 @@ else:
     result["errors"].append(lock_proc.stderr.strip() or "passwd_lock_failed")
 
 if mode == "delete_account":
+    remaining_processes = terminate_user_processes(entry.pw_uid)
+    if remaining_processes:
+        result["errors"].append("processes_remaining: " + ",".join(str(pid) for pid in remaining_processes[:20]))
+
     args = ["userdel"]
     if remove_home:
         args.append("-r")
