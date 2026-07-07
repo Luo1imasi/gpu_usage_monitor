@@ -572,7 +572,11 @@ for item in users:
         pwd.getpwnam(username)
         result["already_exists"] = True
     except KeyError:
-        proc = run(["useradd", "-m", "-s", "/bin/bash", username])
+        useradd_args = ["useradd", "-m", "-s", "/bin/bash"]
+        if group_exists(username):
+            useradd_args.extend(["-g", username])
+        useradd_args.append(username)
+        proc = run(useradd_args)
         if proc.returncode != 0:
             result["errors"].append(proc.stderr.strip() or "useradd_failed")
             continue
@@ -868,6 +872,7 @@ def build_revoke_user_command(username, ssh_keys, mode, clear_authorized_keys, r
     script = f"""
 import json
 import os
+import grp
 import pwd
 import shutil
 import signal
@@ -891,6 +896,8 @@ result = {{
     "authorized_keys_cleared": False,
     "sudoers_removed": False,
     "admin_groups_removed": [],
+    "private_group_removed": False,
+    "private_group_skipped": None,
     "password_locked": False,
     "processes_found": 0,
     "processes_terminated": 0,
@@ -955,10 +962,45 @@ def terminate_user_processes(uid):
     result["processes_remaining"] = remaining
     return remaining
 
+def remove_private_group_if_safe(group_name, gid):
+    if group_name != username or gid < {MIN_MANAGED_UID}:
+        result["private_group_skipped"] = "not_private_user_group"
+        return
+
+    try:
+        group = grp.getgrnam(group_name)
+    except KeyError:
+        result["private_group_skipped"] = "group_not_found"
+        return
+
+    if group.gr_gid != gid:
+        result["private_group_skipped"] = "gid_mismatch"
+        return
+    if group.gr_mem:
+        result["private_group_skipped"] = "group_has_members"
+        return
+
+    primary_users = [
+        item.pw_name
+        for item in pwd.getpwall()
+        if item.pw_gid == gid and item.pw_name != username
+    ]
+    if primary_users:
+        result["private_group_skipped"] = "group_used_as_primary"
+        return
+
+    proc = run(["groupdel", group_name])
+    if proc.returncode == 0:
+        result["private_group_removed"] = True
+        result["private_group_skipped"] = None
+    else:
+        result["errors"].append(proc.stderr.strip() or "groupdel_failed")
+
 try:
     entry = pwd.getpwnam(username)
     result["user_exists"] = True
     result["uid"] = entry.pw_uid
+    user_gid = entry.pw_gid
 except KeyError:
     print(json.dumps(result, ensure_ascii=False))
     raise SystemExit(0)
@@ -1035,6 +1077,7 @@ if mode == "delete_account":
     proc = run(args)
     if proc.returncode == 0:
         result["deleted"] = True
+        remove_private_group_if_safe(username, user_gid)
     else:
         result["errors"].append(proc.stderr.strip() or "userdel_failed")
 

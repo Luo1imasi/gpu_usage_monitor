@@ -1136,12 +1136,30 @@
             return '完成 ' + serverCount + ' 台服务器 / ' + userCount + ' 个用户，新增 ' + keyCount + ' 个 Key，错误 ' + errorCount + ' 个';
         }
 
+        function collectConfigureErrors(results) {
+            const details = [];
+            (results || []).forEach(server => {
+                if (server.error) {
+                    details.push(server.server + ': ' + server.error);
+                    return;
+                }
+                Object.keys(server.users || {}).forEach(username => {
+                    const errors = server.users[username].errors || [];
+                    errors.forEach(error => {
+                        details.push(server.server + ' / ' + username + ': ' + error);
+                    });
+                });
+            });
+            return details;
+        }
+
         function summarizeDeleteResults(data) {
             const results = data && data.results ? data.results : [];
             let serverCount = results.length;
             let errorCount = 0;
             let removedKeys = 0;
             let deletedAccounts = 0;
+            let removedGroups = 0;
             let processCount = 0;
             results.forEach(server => {
                 if (server.error) {
@@ -1154,13 +1172,17 @@
                 if (result.deleted) {
                     deletedAccounts++;
                 }
+                if (result.private_group_removed) {
+                    removedGroups++;
+                }
                 errorCount += (result.errors || []).length;
             });
             const localRemoved = data && data.local ? data.local.removed_lines || 0 : 0;
             const localText = data && data.local && data.local.skipped ? '本地保留' : '本地移除 ' + localRemoved + ' 行';
             const accountText = deletedAccounts > 0 ? '，删除账号 ' + deletedAccounts + ' 个' : '';
+            const groupText = removedGroups > 0 ? '，删除组 ' + removedGroups + ' 个' : '';
             const processText = processCount > 0 ? '，终止进程 ' + processCount + ' 个' : '';
-            return '完成 ' + serverCount + ' 台服务器撤权，远端移除 ' + removedKeys + ' 个 Key' + accountText + processText + '，' + localText + '，错误 ' + errorCount + ' 个';
+            return '完成 ' + serverCount + ' 台服务器撤权，远端移除 ' + removedKeys + ' 个 Key' + accountText + groupText + processText + '，' + localText + '，错误 ' + errorCount + ' 个';
         }
 
         function collectDeleteErrors(data) {
@@ -1276,7 +1298,8 @@
                     setAccessResult('配置失败: ' + (data.error || response.status), true);
                     return;
                 }
-                setAccessResult(summarizeConfigureResults(data.results), false);
+                const details = collectConfigureErrors(data.results);
+                setAccessResult(summarizeConfigureResults(data.results), details.length > 0, details);
                 markAccessMatrixStale();
             } catch(e) {
                 setAccessResult('配置请求失败', true);
