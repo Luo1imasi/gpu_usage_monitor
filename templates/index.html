@@ -179,6 +179,50 @@
             border-radius: 6px;
         }
 
+        .access-query-controls {
+            flex: 1 1 100%;
+            display: grid;
+            grid-template-columns: minmax(260px, 1fr) minmax(220px, 0.45fr);
+            gap: 8px;
+            align-items: stretch;
+        }
+
+        .access-server-filter {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .access-server-option {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            color: #cccccc;
+            background: #1e1e1e;
+            border: 1px solid #3c3c3c;
+            border-radius: 4px;
+            padding: 6px 8px;
+            font-size: 0.74em;
+            white-space: nowrap;
+        }
+
+        .access-user-filter {
+            min-width: 0;
+            background: #1e1e1e;
+            color: #cccccc;
+            border: 1px solid #3c3c3c;
+            border-radius: 4px;
+            padding: 6px 10px;
+            font-size: 0.8em;
+        }
+
+        .access-user-filter:focus {
+            outline: none;
+            border-color: #0e639c;
+            box-shadow: 0 0 0 2px rgba(14, 99, 156, 0.25);
+        }
+
         .access-actions button {
             background: #0e639c;
             color: #fff;
@@ -322,7 +366,8 @@
 
         @media (max-width: 640px) {
             .ssh-key-check,
-            .user-add-form {
+            .user-add-form,
+            .access-query-controls {
                 grid-template-columns: 1fr;
             }
 
@@ -724,6 +769,10 @@
                     </div>
                 </div>
                 <div class="access-actions">
+                    <div class="access-query-controls">
+                        <div class="access-server-filter" id="access-server-filter"></div>
+                        <input class="access-user-filter" id="access-user-filter" type="text" placeholder="用户名：留空全部，多个用逗号或空格分隔" autocomplete="off">
+                    </div>
                     <button id="refresh-access-matrix" type="button">获取权限矩阵</button>
                     <button id="configure-access" type="button">为选中用户配置选中服务器</button>
                     <button id="select-missing-access" type="button">选择缺失权限</button>
@@ -741,6 +790,7 @@
     
     <script>
         let refreshInterval = 5;
+        let configuredServers = [];
         let latestAccessMatrix = null;
         let latestDetectedUserItems = [];
         let adminToken = '';
@@ -814,6 +864,44 @@
             }
             return '';
         }
+
+        function renderAccessServerFilter(servers) {
+            const container = document.getElementById('access-server-filter');
+            container.innerHTML = '';
+            configuredServers = servers || [];
+            configuredServers.forEach(server => {
+                const label = document.createElement('label');
+                label.className = 'access-server-option';
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.className = 'access-server-select';
+                checkbox.value = server.name;
+                checkbox.checked = true;
+                label.appendChild(checkbox);
+                label.appendChild(document.createTextNode(server.name));
+                container.appendChild(label);
+            });
+        }
+
+        function getSelectedAccessServers() {
+            return Array.from(document.querySelectorAll('.access-server-select:checked')).map(input => input.value);
+        }
+
+        function parseAccessUserFilter() {
+            const input = document.getElementById('access-user-filter');
+            const raw = input ? input.value.trim() : '';
+            if (!raw) {
+                return [];
+            }
+            const seen = new Set();
+            return raw.split(/[\s,，;；]+/).map(name => name.trim()).filter(name => {
+                if (!name || seen.has(name)) {
+                    return false;
+                }
+                seen.add(name);
+                return true;
+            });
+        }
         
         async function init() {
             document.getElementById('configure-access').addEventListener('click', configureSelectedAccess);
@@ -843,8 +931,10 @@
                 const r = await fetch('/api/servers');
                 const cfg = await r.json();
                 refreshInterval = cfg.refresh_interval || 5;
+                renderAccessServerFilter(cfg.servers || []);
                 document.getElementById('interval').textContent = refreshInterval;
             } catch(e) {
+                renderAccessServerFilter([]);
                 document.getElementById('interval').textContent = refreshInterval;
             }
             
@@ -872,6 +962,12 @@
             const matrixDiv = document.getElementById('access-matrix');
             const metaDiv = document.getElementById('access-meta');
             const button = document.getElementById('refresh-access-matrix');
+            const selectedServers = getSelectedAccessServers();
+            const selectedUsers = parseAccessUserFilter();
+            if (selectedServers.length === 0) {
+                setAccessResult('请至少选择一台服务器', true);
+                return;
+            }
             if (button) {
                 button.disabled = true;
             }
@@ -884,9 +980,18 @@
                 matrixDiv.appendChild(loadingDiv);
             }
             try {
-                const r = await fetch('/api/access-matrix');
+                const payload = {servers: selectedServers};
+                if (selectedUsers.length > 0) {
+                    payload.users = selectedUsers;
+                }
+                const r = await fetch('/api/access-matrix', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
                 if (!r.ok) {
-                    throw new Error('HTTP ' + r.status);
+                    const errorData = await r.json().catch(() => ({}));
+                    throw new Error(errorData.error || ('HTTP ' + r.status));
                 }
                 const data = await r.json();
                 renderAccessMatrix(data);
@@ -897,10 +1002,11 @@
                     matrixDiv.innerHTML = '';
                     const errorDiv = document.createElement('div');
                     errorDiv.className = 'error';
-                    errorDiv.textContent = 'Failed to fetch access matrix';
+                    errorDiv.textContent = 'Failed to fetch access matrix: ' + e.message;
                     matrixDiv.appendChild(errorDiv);
                     metaDiv.textContent = 'Error';
                 }
+                setAccessResult('权限矩阵获取失败: ' + e.message, true);
             } finally {
                 if (button) {
                     button.disabled = false;
@@ -912,7 +1018,14 @@
         function getAccessMatrixMetaText(data) {
             const users = data && data.users ? data.users : [];
             const servers = data && data.servers ? data.servers : [];
-            return users.length + ' users / ' + servers.length + ' servers';
+            let text = users.length + ' users / ' + servers.length + ' servers';
+            if (data && data.scope && data.scope.partial) {
+                text += ' / 按需';
+            }
+            if (data && data.cached) {
+                text += ' / 缓存';
+            }
+            return text;
         }
 
         function markAccessMatrixStale() {
@@ -932,6 +1045,7 @@
 
             const users = data && data.users ? data.users : [];
             const servers = data && data.servers ? data.servers : [];
+            const partialMatrix = Boolean(data && data.scope && data.scope.partial);
             metaDiv.textContent = getAccessMatrixMetaText(data);
 
             if (users.length === 0 || servers.length === 0) {
@@ -970,11 +1084,19 @@
                 deleteButton.type = 'button';
                 deleteButton.className = 'user-row-action access-danger';
                 deleteButton.textContent = '撤权';
+                deleteButton.disabled = partialMatrix;
+                if (partialMatrix) {
+                    deleteButton.title = '按需矩阵中不可执行全局撤权';
+                }
                 deleteButton.addEventListener('click', () => revokeUserAccess(user.username));
                 const deleteAccountButton = document.createElement('button');
                 deleteAccountButton.type = 'button';
                 deleteAccountButton.className = 'user-row-action access-danger';
                 deleteAccountButton.textContent = '删账号';
+                deleteAccountButton.disabled = partialMatrix;
+                if (partialMatrix) {
+                    deleteAccountButton.title = '按需矩阵中不可执行全局删除';
+                }
                 deleteAccountButton.addEventListener('click', () => deleteUserAccount(user.username));
                 userCell.appendChild(userLabel);
                 userCell.appendChild(deleteButton);
