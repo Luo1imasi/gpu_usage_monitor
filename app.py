@@ -35,12 +35,13 @@ SSH_KEY_TYPES = {
 }
 SYSTEM_SHELL_NAMES = {"false", "nologin", "sync", "halt", "shutdown"}
 PROTECTED_USERNAMES = {"root"}
+SSH_COMMAND_TIMEOUT = 30
 user_file_lock = threading.RLock()
 
 cached_data = []
 last_update = None
 data_lock = threading.Lock()
-executor = ThreadPoolExecutor(max_workers=10)
+executor = ThreadPoolExecutor(max_workers=5)
 ssh_clients = {}
 ssh_lock = threading.Lock()
 
@@ -137,7 +138,7 @@ def invalidate_ssh_client(server):
             del ssh_clients[key]
 
 
-def run_ssh_command(client, command, timeout=30):
+def run_ssh_command(client, command, timeout=SSH_COMMAND_TIMEOUT):
     stdin = stdout = stderr = None
     try:
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
@@ -153,7 +154,7 @@ def run_ssh_command(client, command, timeout=30):
                     pass
 
 
-def run_ssh_command_status(client, command, timeout=30):
+def run_ssh_command_status(client, command, timeout=SSH_COMMAND_TIMEOUT):
     stdin = stdout = stderr = None
     try:
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
@@ -1603,7 +1604,6 @@ def configure_access():
 
 if __name__ == "__main__":
     logger.info("Starting GPU usage monitor...")
-    refresh_data()
 
     worker_thread = threading.Thread(target=background_worker, daemon=True)
     worker_thread.start()
