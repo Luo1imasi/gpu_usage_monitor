@@ -1,6 +1,7 @@
 import csv
 import base64
 import binascii
+import copy
 import hashlib
 import io
 import json
@@ -19,6 +20,7 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("paramiko").setLevel(logging.WARNING)
 
 app = Flask(__name__)
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -35,15 +37,25 @@ SSH_KEY_TYPES = {
 }
 SYSTEM_SHELL_NAMES = {"false", "nologin", "sync", "halt", "shutdown"}
 PROTECTED_USERNAMES = {"root"}
-SSH_COMMAND_TIMEOUT = 30
+SSH_CONNECT_TIMEOUT = 8
+SSH_COMMAND_TIMEOUT = 25
+SSH_KEEPALIVE_SECONDS = 30
+GPU_MAX_WORKERS = 16
+ADMIN_MAX_WORKERS = 8
+ACCESS_MATRIX_CACHE_TTL = 30
+ACCESS_MATRIX_CACHE_MAX_ENTRIES = 64
 user_file_lock = threading.RLock()
 
 cached_data = []
 last_update = None
 data_lock = threading.Lock()
-executor = ThreadPoolExecutor(max_workers=5)
+gpu_executor = ThreadPoolExecutor(max_workers=GPU_MAX_WORKERS)
+admin_executor = ThreadPoolExecutor(max_workers=ADMIN_MAX_WORKERS)
 ssh_clients = {}
+ssh_connect_locks = {}
 ssh_lock = threading.Lock()
+access_matrix_cache = {}
+access_matrix_cache_lock = threading.Lock()
 
 _config_cache = None
 _config_mtime = 0.0
@@ -51,7 +63,8 @@ _config_mtime = 0.0
 
 def cleanup():
     logger.info("Cleaning up resources...")
-    executor.shutdown(wait=False)
+    gpu_executor.shutdown(wait=False)
+    admin_executor.shutdown(wait=False)
     with ssh_lock:
         for client in ssh_clients.values():
             try:
@@ -73,6 +86,7 @@ def load_config():
         with open(CONFIG_PATH) as f:
             _config_cache = json.load(f)
             _config_mtime = mtime
+            invalidate_access_matrix_cache()
             return _config_cache
     except FileNotFoundError:
         logger.error(f"Config file not found: {CONFIG_PATH}")
@@ -80,6 +94,26 @@ def load_config():
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON in config file: {e}")
         return {"servers": [], "refresh_interval": 5}
+
+
+def invalidate_access_matrix_cache():
+    with access_matrix_cache_lock:
+        access_matrix_cache.clear()
+
+
+def get_file_signature(path):
+    try:
+        stat = path.stat()
+        return stat.st_mtime_ns, stat.st_size
+    except FileNotFoundError:
+        return None
+
+
+def get_ssh_connect_lock(key):
+    with ssh_lock:
+        if key not in ssh_connect_locks:
+            ssh_connect_locks[key] = threading.Lock()
+        return ssh_connect_locks[key]
 
 
 def get_ssh_client(server):
@@ -96,6 +130,23 @@ def get_ssh_client(server):
                 logger.debug(f"Error closing stale SSH client: {e}")
             del ssh_clients[key]
 
+    connect_lock = get_ssh_connect_lock(key)
+    with connect_lock:
+        with ssh_lock:
+            if key in ssh_clients:
+                client = ssh_clients[key]
+                if client.get_transport() and client.get_transport().is_active():
+                    return client
+                try:
+                    client.close()
+                except Exception as e:
+                    logger.debug(f"Error closing stale SSH client: {e}")
+                del ssh_clients[key]
+
+        return create_ssh_client(server, key)
+
+
+def create_ssh_client(server, key):
     new_client = paramiko.SSHClient()
     new_client.load_system_host_keys()
     if server.get("accept_unknown_host", False):
@@ -106,12 +157,17 @@ def get_ssh_client(server):
         port=server["port"],
         username=server["username"],
         key_filename=key_file,
-        timeout=10,
-        banner_timeout=10,
+        timeout=SSH_CONNECT_TIMEOUT,
+        banner_timeout=SSH_CONNECT_TIMEOUT,
+        auth_timeout=SSH_CONNECT_TIMEOUT,
+        channel_timeout=SSH_CONNECT_TIMEOUT,
+        look_for_keys=False,
+        allow_agent=False,
     )
     transport = new_client.get_transport()
     if transport:
-        transport.set_keepalive(30)
+        transport.set_keepalive(SSH_KEEPALIVE_SECONDS)
+    new_client._command_lock = threading.RLock()
 
     with ssh_lock:
         if key in ssh_clients:
@@ -139,6 +195,14 @@ def invalidate_ssh_client(server):
 
 
 def run_ssh_command(client, command, timeout=SSH_COMMAND_TIMEOUT):
+    lock = getattr(client, "_command_lock", None)
+    if lock is not None:
+        with lock:
+            return _run_ssh_command_unlocked(client, command, timeout)
+    return _run_ssh_command_unlocked(client, command, timeout)
+
+
+def _run_ssh_command_unlocked(client, command, timeout):
     stdin = stdout = stderr = None
     try:
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
@@ -155,6 +219,14 @@ def run_ssh_command(client, command, timeout=SSH_COMMAND_TIMEOUT):
 
 
 def run_ssh_command_status(client, command, timeout=SSH_COMMAND_TIMEOUT):
+    lock = getattr(client, "_command_lock", None)
+    if lock is not None:
+        with lock:
+            return _run_ssh_command_status_unlocked(client, command, timeout)
+    return _run_ssh_command_status_unlocked(client, command, timeout)
+
+
+def _run_ssh_command_status_unlocked(client, command, timeout):
     stdin = stdout = stderr = None
     try:
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
@@ -172,6 +244,8 @@ def run_ssh_command_status(client, command, timeout=SSH_COMMAND_TIMEOUT):
 
 
 def sanitize_error(error_msg):
+    if not error_msg:
+        return "Unknown error"
     sanitized = re.sub(r"\d{1,3}(\.\d{1,3}){3}", "***", error_msg)
     sanitized = re.sub(r":\d{4,5}", ":***", sanitized)
     sanitized = re.sub(r"/home/[\w./\-]+", "/***", sanitized)
@@ -321,6 +395,9 @@ def remove_user_from_file(username):
             f.writelines(kept_lines)
         os.replace(tmp_path, USER_FILE_PATH)
 
+    if removed_lines:
+        invalidate_access_matrix_cache()
+
     return {"username": username, "removed_lines": removed_lines}, 200
 
 
@@ -339,6 +416,7 @@ def add_user_key(username, ssh_key):
 
         append_user_key_unlocked(username, normalized_key)
 
+    invalidate_access_matrix_cache()
     return {"username": username, "key_added": True}, 200
 
 
@@ -478,6 +556,9 @@ def import_user_keys(items):
             append_user_key_unlocked(username, normalized_key)
             imported.append({"username": username})
 
+    if imported:
+        invalidate_access_matrix_cache()
+
     return {
         "error": None,
         "imported": imported,
@@ -518,6 +599,31 @@ def get_refresh_interval():
 
 def get_users_by_name():
     return {user["username"]: user for user in load_user_keys()}
+
+
+def normalize_name_list(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = re.split(r"[\s,，;；]+", value)
+    elif isinstance(value, list):
+        items = []
+        for item in value:
+            if isinstance(item, str):
+                items.extend(re.split(r"[\s,，;；]+", item))
+            else:
+                return value
+    else:
+        return value
+
+    result = []
+    seen = set()
+    for item in items:
+        name = item.strip()
+        if name and name not in seen:
+            result.append(name)
+            seen.add(name)
+    return result
 
 
 def build_configure_users_command(users):
@@ -678,7 +784,7 @@ def configure_selected_access(server_names, usernames):
     selected_users = [users_by_name[username] for username in usernames]
 
     futures = {
-        executor.submit(configure_access_for_server, server, selected_users): server
+        admin_executor.submit(configure_access_for_server, server, selected_users): server
         for server in selected_servers
     }
     results = []
@@ -691,6 +797,7 @@ def configure_selected_access(server_names, usernames):
             results.append({"server": server["name"], "error": sanitize_error(str(e)), "users": {}})
 
     results.sort(key=lambda item: item["server"])
+    invalidate_access_matrix_cache()
     return {"error": None, "results": results}, 200
 
 
@@ -727,7 +834,7 @@ def configure_access_pairs(pairs):
     for server_name, server_users in grouped_users.items():
         selected_users = [users_by_name[username] for username in sorted(server_users)]
         server = servers_by_name[server_name]
-        futures[executor.submit(configure_access_for_server, server, selected_users)] = server
+        futures[admin_executor.submit(configure_access_for_server, server, selected_users)] = server
 
     results = []
     for future in as_completed(futures):
@@ -739,6 +846,7 @@ def configure_access_pairs(pairs):
             results.append({"server": server["name"], "error": sanitize_error(str(e)), "users": {}})
 
     results.sort(key=lambda item: item["server"])
+    invalidate_access_matrix_cache()
     return {"error": None, "results": results}, 200
 
 
@@ -852,7 +960,7 @@ def detect_server_users(server_names=None):
         return {**error, "results": []}, 400
 
     futures = {
-        executor.submit(detect_users_for_server, server): server
+        admin_executor.submit(detect_users_for_server, server): server
         for server in selected_servers
     }
     results = []
@@ -1145,7 +1253,7 @@ def delete_user_access(username, payload):
     remove_from_user_file = bool(payload.get("remove_from_user_file", True))
 
     futures = {
-        executor.submit(
+        admin_executor.submit(
             revoke_user_on_server,
             server,
             username,
@@ -1178,6 +1286,7 @@ def delete_user_access(username, payload):
         else:
             local_result, _ = remove_user_from_file(username)
 
+    invalidate_access_matrix_cache()
     return {"error": None, "local": local_result, "results": results}, 200
 
 
@@ -1258,9 +1367,107 @@ def check_access_matrix_for_server(server, users):
         return {"server": server["name"], "error": sanitize_error(str(e)), "users": {}}
 
 
-def build_access_matrix():
-    users = load_user_keys()
-    servers = get_configured_servers()
+def resolve_access_matrix_scope(server_names=None, usernames=None):
+    all_servers = get_configured_servers()
+    servers_by_name = {
+        server["name"]: server
+        for server in all_servers
+        if isinstance(server.get("name"), str)
+    }
+    server_names = normalize_name_list(server_names)
+    if server_names is None:
+        selected_servers = all_servers
+    elif not isinstance(server_names, list):
+        return None, None, None, {"error": "servers_must_be_a_list"}
+    else:
+        clean_server_names = [name for name in server_names if isinstance(name, str)]
+        unknown_servers = sorted(set(clean_server_names) - set(servers_by_name))
+        if unknown_servers:
+            return None, None, None, {
+                "error": "invalid_selection",
+                "unknown_servers": unknown_servers,
+            }
+        requested_servers = set(clean_server_names)
+        selected_servers = [
+            server for server in all_servers if server["name"] in requested_servers
+        ]
+
+    all_users = load_user_keys()
+    users_by_name = {user["username"]: user for user in all_users}
+    usernames = normalize_name_list(usernames)
+    if usernames is None:
+        selected_users = all_users
+    elif not isinstance(usernames, list):
+        return None, None, None, {"error": "users_must_be_a_list"}
+    else:
+        clean_usernames = [name for name in usernames if isinstance(name, str)]
+        unknown_users = sorted(set(clean_usernames) - set(users_by_name))
+        if unknown_users:
+            return None, None, None, {
+                "error": "invalid_selection",
+                "unknown_users": unknown_users,
+            }
+        requested_users = set(clean_usernames)
+        selected_users = [
+            user for user in all_users if user["username"] in requested_users
+        ]
+
+    scope = {
+        "server_count": len(selected_servers),
+        "total_server_count": len(all_servers),
+        "user_count": len(selected_users),
+        "total_user_count": len(all_users),
+        "partial": len(selected_servers) != len(all_servers)
+        or len(selected_users) != len(all_users),
+    }
+    return selected_servers, selected_users, scope, None
+
+
+def access_matrix_cache_key(servers, users):
+    return (
+        tuple(server["name"] for server in servers),
+        tuple(user["username"] for user in users),
+        get_file_signature(USER_FILE_PATH),
+        get_file_signature(CONFIG_PATH),
+    )
+
+
+def get_cached_access_matrix(key):
+    now = time.time()
+    with access_matrix_cache_lock:
+        cached = access_matrix_cache.get(key)
+        if not cached:
+            return None
+        created_at, matrix = cached
+        if now - created_at > ACCESS_MATRIX_CACHE_TTL:
+            del access_matrix_cache[key]
+            return None
+        result = copy.deepcopy(matrix)
+        result["cached"] = True
+        result["cache_age"] = round(now - created_at, 1)
+        return result
+
+
+def set_cached_access_matrix(key, matrix):
+    with access_matrix_cache_lock:
+        access_matrix_cache[key] = (time.time(), copy.deepcopy(matrix))
+        if len(access_matrix_cache) > ACCESS_MATRIX_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                access_matrix_cache,
+                key=lambda item: access_matrix_cache[item][0],
+            )
+            del access_matrix_cache[oldest_key]
+
+
+def build_access_matrix(server_names=None, usernames=None):
+    servers, users, scope, error = resolve_access_matrix_scope(server_names, usernames)
+    if error:
+        return {**error, "servers": [], "users": []}, 400
+
+    cache_key = access_matrix_cache_key(servers, users)
+    cached = get_cached_access_matrix(cache_key)
+    if cached:
+        return cached, 200
 
     matrix = {
         "servers": [{"name": server["name"]} for server in servers],
@@ -1268,13 +1475,19 @@ def build_access_matrix():
             {"username": user["username"], "key_count": len(user["key_hashes"]), "servers": []}
             for user in users
         ],
+        "scope": {
+            **scope,
+            "cache_ttl": ACCESS_MATRIX_CACHE_TTL,
+        },
+        "cached": False,
     }
 
     if not users or not servers:
-        return matrix
+        set_cached_access_matrix(cache_key, matrix)
+        return matrix, 200
 
     futures = {
-        executor.submit(check_access_matrix_for_server, server, users): server
+        admin_executor.submit(check_access_matrix_for_server, server, users): server
         for server in servers
     }
     server_results = {}
@@ -1307,7 +1520,8 @@ def build_access_matrix():
                 }
             )
 
-    return matrix
+    set_cached_access_matrix(cache_key, matrix)
+    return matrix, 200
 
 
 def parse_gpu_query(output):
@@ -1373,50 +1587,88 @@ def parse_compute_apps(output, bus_to_idx, gpus):
             )
 
 
+GPU_INFO_GPU_START = "__GPU_MONITOR_GPU_START__"
+GPU_INFO_GPU_END = "__GPU_MONITOR_GPU_END__"
+GPU_INFO_APPS_START = "__GPU_MONITOR_APPS_START__"
+GPU_INFO_APPS_END = "__GPU_MONITOR_APPS_END__"
+GPU_INFO_PS_START = "__GPU_MONITOR_PS_START__"
+GPU_INFO_PS_END = "__GPU_MONITOR_PS_END__"
+
+
+def build_gpu_info_command():
+    gpu_fields = "index,gpu_bus_id,name,utilization.gpu,memory.used,memory.total"
+    app_fields = "gpu_bus_id,pid,used_gpu_memory"
+    return f"""
+gpu_status=0
+echo {GPU_INFO_GPU_START}
+gpu_output="$(nvidia-smi --query-gpu={gpu_fields} --format=csv,noheader,nounits)" || gpu_status=$?
+printf '%s\n' "$gpu_output"
+echo {GPU_INFO_GPU_END}
+echo {GPU_INFO_APPS_START}
+has_gpu_memory="$(printf '%s\n' "$gpu_output" | awk -F, '{{gsub(/^[ \\t]+|[ \\t]+$/, "", $5); if (($5 + 0) > 0) {{print "1"; exit}}}}')"
+apps=""
+if [ "$gpu_status" -eq 0 ] && [ "$has_gpu_memory" = "1" ]; then
+    apps="$(nvidia-smi --query-compute-apps={app_fields} --format=csv,noheader 2>/dev/null || true)"
+fi
+printf '%s\n' "$apps"
+echo {GPU_INFO_APPS_END}
+echo {GPU_INFO_PS_START}
+pids="$(printf '%s\n' "$apps" | awk -F, '{{gsub(/^[ \\t]+|[ \\t]+$/, "", $2); if ($2 ~ /^[0-9]+$/) {{printf "%s%s", sep, $2; sep=","}}}}')"
+if [ -n "$pids" ]; then
+    ps -o pid=,user= -p "$pids" 2>/dev/null
+fi
+echo {GPU_INFO_PS_END}
+exit "$gpu_status"
+""".strip()
+
+
+def extract_marked_section(output, start_marker, end_marker):
+    start = output.find(start_marker)
+    if start == -1:
+        return ""
+    start += len(start_marker)
+    end = output.find(end_marker, start)
+    if end == -1:
+        return ""
+    return output[start:end].strip()
+
+
+def apply_process_users(ps_output, gpus):
+    if not ps_output:
+        return
+
+    user_map = {}
+    for line in ps_output.strip().split("\n"):
+        if line.strip():
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                user_map[parts[0]] = parts[1]
+
+    for gpu in gpus.values():
+        for proc in gpu["processes"]:
+            if str(proc["pid"]) in user_map:
+                proc["user"] = user_map[str(proc["pid"])]
+
+
 def get_gpu_info_ssh(server):
     try:
         client = get_ssh_client(server)
 
-        gpu_fields = "index,gpu_bus_id,name,utilization.gpu,memory.used,memory.total"
-        out, err = run_ssh_command(
-            client,
-            f"nvidia-smi --query-gpu={gpu_fields} --format=csv,noheader,nounits",
+        status, out, err = run_ssh_command_status(
+            client, build_gpu_info_command(), timeout=SSH_COMMAND_TIMEOUT
         )
-        if not out.strip():
+        gpu_out = extract_marked_section(out, GPU_INFO_GPU_START, GPU_INFO_GPU_END)
+        if status != 0 or not gpu_out.strip():
             error_msg = err.strip() if err else "No GPU info returned"
             logger.error(f"nvidia-smi error on {server['name']}: {error_msg}")
             return {"error": sanitize_error(error_msg), "server": server["name"]}
 
-        gpus, bus_to_idx = parse_gpu_query(out)
-
-        proc_out, _ = run_ssh_command(
-            client,
-            "nvidia-smi --query-compute-apps=gpu_bus_id,pid,used_gpu_memory --format=csv,noheader",
-        )
+        gpus, bus_to_idx = parse_gpu_query(gpu_out)
+        proc_out = extract_marked_section(out, GPU_INFO_APPS_START, GPU_INFO_APPS_END)
         parse_compute_apps(proc_out, bus_to_idx, gpus)
 
-        pids = []
-        for gpu in gpus.values():
-            for proc in gpu["processes"]:
-                pids.append(str(proc["pid"]))
-
-        if pids:
-            pid_list = ",".join(pids)
-            ps_out, _ = run_ssh_command(
-                client,
-                f"ps -o pid=,user= -p {pid_list} 2>/dev/null",
-            )
-            if ps_out:
-                user_map = {}
-                for line in ps_out.strip().split("\n"):
-                    if line.strip():
-                        parts = line.strip().split()
-                        if len(parts) >= 2:
-                            user_map[parts[0]] = parts[1]
-                for gpu in gpus.values():
-                    for proc in gpu["processes"]:
-                        if str(proc["pid"]) in user_map:
-                            proc["user"] = user_map[str(proc["pid"])]
+        ps_out = extract_marked_section(out, GPU_INFO_PS_START, GPU_INFO_PS_END)
+        apply_process_users(ps_out, gpus)
 
         for gpu in gpus.values():
             user_memory = {}
@@ -1447,9 +1699,10 @@ def get_gpu_info_ssh(server):
             "error": None,
         }
     except Exception as e:
-        logger.error(f"Error getting GPU info for {server['name']}: {e}")
+        error_message = str(e) or e.__class__.__name__
+        logger.error(f"Error getting GPU info for {server['name']}: {error_message}")
         invalidate_ssh_client(server)
-        return {"error": sanitize_error(str(e)), "server": server["name"]}
+        return {"error": sanitize_error(error_message), "server": server["name"]}
 
 
 def refresh_data():
@@ -1459,7 +1712,7 @@ def refresh_data():
     results = []
 
     futures = {
-        executor.submit(get_gpu_info_ssh, server): server
+        gpu_executor.submit(get_gpu_info_ssh, server): server
         for server in servers
     }
     for future in as_completed(futures):
@@ -1508,9 +1761,25 @@ def get_servers():
     )
 
 
-@app.route("/api/access-matrix")
+def get_query_name_list(name):
+    values = request.args.getlist(name)
+    if not values:
+        return None
+    return normalize_name_list(values)
+
+
+@app.route("/api/access-matrix", methods=["GET", "POST"])
 def get_access_matrix():
-    return jsonify(build_access_matrix())
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        server_names = payload.get("servers")
+        usernames = payload.get("users")
+    else:
+        server_names = get_query_name_list("servers")
+        usernames = get_query_name_list("users")
+
+    result, status_code = build_access_matrix(server_names, usernames)
+    return jsonify(result), status_code
 
 
 @app.route("/api/check-ssh-key", methods=["POST"])
