@@ -2,11 +2,14 @@ import csv
 import base64
 import binascii
 import copy
+import errno
 import hashlib
 import io
 import json
 import os
+import random
 import re
+import socket
 import time
 import threading
 import logging
@@ -37,23 +40,42 @@ SSH_KEY_TYPES = {
 }
 SYSTEM_SHELL_NAMES = {"false", "nologin", "sync", "halt", "shutdown"}
 PROTECTED_USERNAMES = {"root"}
-SSH_CONNECT_TIMEOUT = 8
-SSH_COMMAND_TIMEOUT = 25
-SSH_KEEPALIVE_SECONDS = 30
-GPU_MAX_WORKERS = 16
-ADMIN_MAX_WORKERS = 8
+SSH_CONNECT_TIMEOUT = 30
+SSH_BANNER_TIMEOUT = 45
+SSH_AUTH_TIMEOUT = 45
+SSH_CONNECTION_TOTAL_TIMEOUT = 120
+SSH_CHANNEL_OPEN_TIMEOUT = 60
+SSH_REUSED_CHANNEL_OPEN_TIMEOUT = 20
+SSH_COMMAND_TIMEOUT = 60
+SSH_COMMAND_TOTAL_TIMEOUT = 90
+SSH_OPERATION_TIMEOUT = 150
+SSH_KEEPALIVE_SECONDS = 15
+SSH_READONLY_RETRIES = 1
+SSH_RETRY_BACKOFF_BASE_SECONDS = 2
+SSH_RETRY_BACKOFF_MAX_SECONDS = 4
+SSH_RETRY_JITTER_SECONDS = 2
+SSH_CONNECT_JITTER_SECONDS = 1.5
+SSH_CONNECT_MAX_CONCURRENCY = 3
+SSH_CLEANUP_TIMEOUT_SECONDS = 1
+SSH_CLEANUP_GRACE_SECONDS = 1
+GPU_MAX_WORKERS = 5
+ADMIN_MAX_WORKERS = 4
+API_POLL_INTERVAL_SECONDS = 5
 ACCESS_MATRIX_CACHE_TTL = 30
 ACCESS_MATRIX_CACHE_MAX_ENTRIES = 64
 user_file_lock = threading.RLock()
 
 cached_data = []
+cached_server_identities = {}
 last_update = None
 data_lock = threading.Lock()
 gpu_executor = ThreadPoolExecutor(max_workers=GPU_MAX_WORKERS)
 admin_executor = ThreadPoolExecutor(max_workers=ADMIN_MAX_WORKERS)
 ssh_clients = {}
 ssh_connect_locks = {}
+ssh_command_locks = {}
 ssh_lock = threading.Lock()
+ssh_connect_semaphore = threading.BoundedSemaphore(SSH_CONNECT_MAX_CONCURRENCY)
 access_matrix_cache = {}
 access_matrix_cache_lock = threading.Lock()
 
@@ -72,6 +94,8 @@ def cleanup():
             except Exception as e:
                 logger.debug(f"Error closing SSH client: {e}")
         ssh_clients.clear()
+        ssh_connect_locks.clear()
+        ssh_command_locks.clear()
 
 
 atexit.register(cleanup)
@@ -90,10 +114,158 @@ def load_config():
             return _config_cache
     except FileNotFoundError:
         logger.error(f"Config file not found: {CONFIG_PATH}")
-        return {"servers": [], "refresh_interval": 5}
+        return {"servers": [], "refresh_interval": 30}
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON in config file: {e}")
-        return {"servers": [], "refresh_interval": 5}
+        return {"servers": [], "refresh_interval": 30}
+
+
+def get_bounded_number(source, key, default, minimum, maximum, integer=False):
+    value = source.get(key, default) if isinstance(source, dict) else default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    value = max(minimum, min(maximum, value))
+    return int(value) if integer else float(value)
+
+
+def get_ssh_settings(server=None):
+    config = load_config()
+    global_settings = config.get("ssh", {})
+    if not isinstance(global_settings, dict):
+        global_settings = {}
+
+    server_settings = server.get("ssh", {}) if isinstance(server, dict) else {}
+    if not isinstance(server_settings, dict):
+        server_settings = {}
+    settings = {**global_settings, **server_settings}
+
+    return {
+        "connect_timeout": get_bounded_number(
+            settings, "connect_timeout_seconds", SSH_CONNECT_TIMEOUT, 1, 300
+        ),
+        "banner_timeout": get_bounded_number(
+            settings, "banner_timeout_seconds", SSH_BANNER_TIMEOUT, 1, 300
+        ),
+        "auth_timeout": get_bounded_number(
+            settings, "auth_timeout_seconds", SSH_AUTH_TIMEOUT, 1, 300
+        ),
+        "connection_total_timeout": get_bounded_number(
+            settings,
+            "connection_total_timeout_seconds",
+            SSH_CONNECTION_TOTAL_TIMEOUT,
+            5,
+            600,
+        ),
+        "channel_open_timeout": get_bounded_number(
+            settings,
+            "channel_open_timeout_seconds",
+            SSH_CHANNEL_OPEN_TIMEOUT,
+            1,
+            300,
+        ),
+        "reused_channel_open_timeout": get_bounded_number(
+            settings,
+            "reused_channel_open_timeout_seconds",
+            SSH_REUSED_CHANNEL_OPEN_TIMEOUT,
+            1,
+            300,
+        ),
+        "command_idle_timeout": get_bounded_number(
+            settings,
+            "command_idle_timeout_seconds",
+            SSH_COMMAND_TIMEOUT,
+            1,
+            300,
+        ),
+        "keepalive_interval": get_bounded_number(
+            settings,
+            "keepalive_interval_seconds",
+            SSH_KEEPALIVE_SECONDS,
+            1,
+            300,
+            integer=True,
+        ),
+        "retry_count": get_bounded_number(
+            settings,
+            "retry_count",
+            SSH_READONLY_RETRIES,
+            0,
+            1,
+            integer=True,
+        ),
+        "retry_backoff_base": get_bounded_number(
+            settings,
+            "retry_backoff_base_seconds",
+            SSH_RETRY_BACKOFF_BASE_SECONDS,
+            0,
+            30,
+        ),
+        "retry_backoff_max": get_bounded_number(
+            settings,
+            "retry_backoff_max_seconds",
+            SSH_RETRY_BACKOFF_MAX_SECONDS,
+            0,
+            60,
+        ),
+        "retry_jitter": get_bounded_number(
+            settings,
+            "retry_jitter_seconds",
+            SSH_RETRY_JITTER_SECONDS,
+            0,
+            30,
+        ),
+        "connect_jitter": get_bounded_number(
+            settings,
+            "connect_jitter_seconds",
+            SSH_CONNECT_JITTER_SECONDS,
+            0,
+            30,
+        ),
+    }
+
+
+def get_monitoring_settings():
+    config = load_config()
+    settings = config.get("monitoring", {})
+    if not isinstance(settings, dict):
+        settings = {}
+
+    legacy_refresh_interval = config.get("refresh_interval", 30)
+    if isinstance(legacy_refresh_interval, bool) or not isinstance(
+        legacy_refresh_interval, (int, float)
+    ):
+        legacy_refresh_interval = 30
+
+    return {
+        "refresh_interval": get_bounded_number(
+            settings,
+            "refresh_interval_seconds",
+            legacy_refresh_interval,
+            5,
+            3600,
+        ),
+        "gpu_command_total_timeout": get_bounded_number(
+            settings,
+            "gpu_command_total_timeout_seconds",
+            SSH_COMMAND_TOTAL_TIMEOUT,
+            5,
+            600,
+        ),
+        "gpu_operation_timeout": get_bounded_number(
+            settings,
+            "gpu_operation_timeout_seconds",
+            SSH_OPERATION_TIMEOUT,
+            5,
+            900,
+        ),
+        "api_poll_interval": get_bounded_number(
+            settings,
+            "api_poll_interval_seconds",
+            API_POLL_INTERVAL_SECONDS,
+            1,
+            60,
+        ),
+    }
 
 
 def invalidate_access_matrix_cache():
@@ -109,6 +281,91 @@ def get_file_signature(path):
         return None
 
 
+class SSHCommandOutcomeUnknown(RuntimeError):
+    pass
+
+
+class SSHOperationDeadlineExceeded(TimeoutError):
+    pass
+
+
+SSH_STAGE_PRE_DISPATCH = "pre_dispatch"
+SSH_STAGE_DISPATCHED = "dispatched"
+
+
+class SSHCommandFailure(RuntimeError):
+    def __init__(self, cause, stage):
+        self.cause = cause
+        self.stage = stage
+        self.transport_error = is_retryable_ssh_transport_error(cause)
+        super().__init__(str(cause) or cause.__class__.__name__)
+
+
+def make_ssh_deadline(timeout):
+    if timeout is None:
+        return None
+    return time.monotonic() + timeout
+
+
+def make_ssh_cleanup_deadline(deadline):
+    if deadline is None:
+        return None
+    return deadline + SSH_CLEANUP_GRACE_SECONDS
+
+
+def get_ssh_cleanup_wait_timeout(cleanup_deadline, timeout):
+    if cleanup_deadline is None:
+        return timeout
+    return max(0.0, min(timeout, cleanup_deadline - time.monotonic()))
+
+
+def get_ssh_deadline_remaining(deadline, label="SSH operation"):
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SSHOperationDeadlineExceeded(f"{label} deadline exceeded")
+    return remaining
+
+
+def cap_ssh_timeout(timeout, deadline, label):
+    remaining = get_ssh_deadline_remaining(deadline, label)
+    if remaining is None:
+        return timeout
+    return min(timeout, remaining)
+
+
+def acquire_until_deadline(lock, deadline, label):
+    remaining = get_ssh_deadline_remaining(deadline, label)
+    if remaining is None:
+        lock.acquire()
+        return
+    if not lock.acquire(timeout=remaining):
+        raise SSHOperationDeadlineExceeded(f"{label} deadline exceeded")
+
+
+def sleep_until_deadline(delay, deadline, label):
+    if delay <= 0:
+        return
+    remaining = get_ssh_deadline_remaining(deadline, label)
+    if remaining is not None and delay >= remaining:
+        raise SSHOperationDeadlineExceeded(f"{label} deadline exceeded")
+    time.sleep(delay)
+
+
+def get_ssh_cache_key(server):
+    return server["host"], server["port"], server["username"]
+
+
+def get_ssh_connection_identity(server):
+    key_file = Path(os.path.expanduser(server["key_file"])).resolve()
+    return (
+        str(key_file),
+        get_file_signature(key_file),
+        bool(server.get("accept_unknown_host", False)),
+    )
+
+
 def get_ssh_connect_lock(key):
     with ssh_lock:
         if key not in ssh_connect_locks:
@@ -116,131 +373,768 @@ def get_ssh_connect_lock(key):
         return ssh_connect_locks[key]
 
 
-def get_ssh_client(server):
-    key = (server["host"], server["port"], server["username"])
-
+def get_ssh_command_lock(key):
     with ssh_lock:
-        if key in ssh_clients:
-            client = ssh_clients[key]
-            if client.get_transport() and client.get_transport().is_active():
-                return client
-            try:
-                client.close()
-            except Exception as e:
-                logger.debug(f"Error closing stale SSH client: {e}")
-            del ssh_clients[key]
+        if key not in ssh_command_locks:
+            ssh_command_locks[key] = threading.RLock()
+        return ssh_command_locks[key]
+
+
+def close_ssh_client(client, cleanup_deadline=None):
+    if client is None:
+        return True
+    client._invalid = True
+    close_timeout = get_ssh_cleanup_wait_timeout(
+        cleanup_deadline,
+        SSH_CLEANUP_TIMEOUT_SECONDS,
+    )
+    if run_cleanup_with_timeout(client.close, close_timeout):
+        return True
+
+    try:
+        transport = client.get_transport()
+    except Exception:
+        transport = None
+    if transport is not None:
+        transport_timeout = get_ssh_cleanup_wait_timeout(
+            cleanup_deadline,
+            SSH_CLEANUP_TIMEOUT_SECONDS,
+        )
+        run_cleanup_with_timeout(transport.close, transport_timeout)
+    logger.warning("Timed out while closing an SSH client; transport was abandoned")
+    return False
+
+
+def is_ssh_client_usable(client, identity=None):
+    if client is None or getattr(client, "_invalid", False):
+        return False
+    if identity is not None and getattr(client, "_ssh_identity", None) != identity:
+        return False
+    try:
+        transport = client.get_transport()
+        return bool(
+            transport
+            and transport.is_active()
+            and transport.is_authenticated()
+        )
+    except Exception:
+        return False
+
+
+def get_cached_ssh_client(key, identity, cleanup_deadline=None):
+    stale_client = None
+    with ssh_lock:
+        client = ssh_clients.get(key)
+        if is_ssh_client_usable(client, identity):
+            return client
+        if client is not None:
+            stale_client = ssh_clients.pop(key)
+
+    close_ssh_client(stale_client, cleanup_deadline=cleanup_deadline)
+    return None
+
+
+def get_ssh_client(server, deadline=None):
+    key = get_ssh_cache_key(server)
+    identity = get_ssh_connection_identity(server)
+    cleanup_deadline = make_ssh_cleanup_deadline(deadline)
+    client = get_cached_ssh_client(
+        key,
+        identity,
+        cleanup_deadline=cleanup_deadline,
+    )
+    if client is not None:
+        return client, True
 
     connect_lock = get_ssh_connect_lock(key)
-    with connect_lock:
-        with ssh_lock:
-            if key in ssh_clients:
-                client = ssh_clients[key]
-                if client.get_transport() and client.get_transport().is_active():
-                    return client
-                try:
-                    client.close()
-                except Exception as e:
-                    logger.debug(f"Error closing stale SSH client: {e}")
-                del ssh_clients[key]
+    acquire_until_deadline(connect_lock, deadline, "SSH connect queue")
+    try:
+        client = get_cached_ssh_client(
+            key,
+            identity,
+            cleanup_deadline=cleanup_deadline,
+        )
+        if client is not None:
+            return client, True
+        return create_ssh_client(
+            server,
+            key,
+            identity,
+            deadline=deadline,
+            cleanup_deadline=cleanup_deadline,
+        )
+    finally:
+        connect_lock.release()
 
-        return create_ssh_client(server, key)
 
+def connect_ssh_client(
+    client,
+    connect_kwargs,
+    deadline,
+    cleanup_deadline=None,
+    cleanup_timeout=SSH_CLEANUP_TIMEOUT_SECONDS,
+):
+    if cleanup_deadline is None:
+        cleanup_deadline = make_ssh_cleanup_deadline(deadline)
+    completed = threading.Event()
+    abandoned = threading.Event()
+    errors = []
 
-def create_ssh_client(server, key):
-    new_client = paramiko.SSHClient()
-    new_client.load_system_host_keys()
-    if server.get("accept_unknown_host", False):
-        new_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    key_file = os.path.expanduser(server["key_file"])
-    new_client.connect(
-        hostname=server["host"],
-        port=server["port"],
-        username=server["username"],
-        key_filename=key_file,
-        timeout=SSH_CONNECT_TIMEOUT,
-        banner_timeout=SSH_CONNECT_TIMEOUT,
-        auth_timeout=SSH_CONNECT_TIMEOUT,
-        channel_timeout=SSH_CONNECT_TIMEOUT,
-        look_for_keys=False,
-        allow_agent=False,
+    def connect():
+        try:
+            client.connect(**connect_kwargs)
+            if abandoned.is_set():
+                close_ssh_client(
+                    client,
+                    cleanup_deadline=cleanup_deadline,
+                )
+        except Exception as e:
+            errors.append(e)
+        finally:
+            completed.set()
+
+    thread = threading.Thread(
+        target=connect,
+        name="ssh-connect",
+        daemon=True,
     )
-    transport = new_client.get_transport()
-    if transport:
-        transport.set_keepalive(SSH_KEEPALIVE_SECONDS)
-    new_client._command_lock = threading.RLock()
+    thread.start()
+
+    remaining = get_ssh_deadline_remaining(deadline, "SSH connection")
+    if not completed.wait(remaining):
+        abandoned.set()
+        close_ssh_client(client, cleanup_deadline=cleanup_deadline)
+        completed.wait(
+            get_ssh_cleanup_wait_timeout(cleanup_deadline, cleanup_timeout)
+        )
+        raise TimeoutError("SSH connection total timeout")
+    if errors:
+        raise errors[0]
+
+
+def create_ssh_client(
+    server,
+    key,
+    identity=None,
+    deadline=None,
+    cleanup_deadline=None,
+):
+    identity = identity or get_ssh_connection_identity(server)
+    if cleanup_deadline is None:
+        cleanup_deadline = make_ssh_cleanup_deadline(deadline)
+    settings = get_ssh_settings(server)
+    new_client = paramiko.SSHClient()
+    started = time.monotonic()
+    semaphore_acquired = False
+
+    try:
+        new_client.load_system_host_keys()
+        if server.get("accept_unknown_host", False):
+            new_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        connect_jitter = settings["connect_jitter"]
+        if connect_jitter > 0:
+            sleep_until_deadline(
+                random.uniform(0, connect_jitter),
+                deadline,
+                "SSH connect jitter",
+            )
+
+        acquire_until_deadline(
+            ssh_connect_semaphore,
+            deadline,
+            "SSH connection semaphore",
+        )
+        semaphore_acquired = True
+        try:
+            connection_deadline = time.monotonic() + settings[
+                "connection_total_timeout"
+            ]
+            if deadline is not None:
+                connection_deadline = min(connection_deadline, deadline)
+
+            connect_ssh_client(
+                new_client,
+                {
+                    "hostname": server["host"],
+                    "port": server["port"],
+                    "username": server["username"],
+                    "key_filename": identity[0],
+                    "timeout": cap_ssh_timeout(
+                        settings["connect_timeout"],
+                        connection_deadline,
+                        "SSH TCP connect",
+                    ),
+                    "banner_timeout": cap_ssh_timeout(
+                        settings["banner_timeout"],
+                        connection_deadline,
+                        "SSH banner",
+                    ),
+                    "auth_timeout": cap_ssh_timeout(
+                        settings["auth_timeout"],
+                        connection_deadline,
+                        "SSH authentication",
+                    ),
+                    "channel_timeout": cap_ssh_timeout(
+                        settings["channel_open_timeout"],
+                        connection_deadline,
+                        "SSH channel default",
+                    ),
+                    "look_for_keys": False,
+                    "allow_agent": False,
+                },
+                deadline=connection_deadline,
+                cleanup_deadline=cleanup_deadline,
+            )
+        finally:
+            ssh_connect_semaphore.release()
+            semaphore_acquired = False
+
+        transport = new_client.get_transport()
+        if not transport or not transport.is_active() or not transport.is_authenticated():
+            raise paramiko.SSHException("SSH transport is not authenticated")
+        transport.set_keepalive(settings["keepalive_interval"])
+
+        new_client._command_lock = threading.RLock()
+        new_client._invalid = False
+        new_client._ssh_identity = identity
+        new_client._channel_open_timeout = settings["channel_open_timeout"]
+        new_client._command_idle_timeout = settings["command_idle_timeout"]
+    except Exception:
+        if semaphore_acquired:
+            ssh_connect_semaphore.release()
+        close_ssh_client(new_client, cleanup_deadline=cleanup_deadline)
+        raise
+
+    old_client = None
+    existing_client = None
+    with ssh_lock:
+        existing = ssh_clients.get(key)
+        if is_ssh_client_usable(existing, identity):
+            existing_client = existing
+        else:
+            if existing is not None:
+                old_client = ssh_clients.pop(key)
+            ssh_clients[key] = new_client
+
+    if existing_client is not None:
+        close_ssh_client(new_client, cleanup_deadline=cleanup_deadline)
+        return existing_client, True
+    close_ssh_client(old_client, cleanup_deadline=cleanup_deadline)
+    logger.info(
+        "SSH connected to %s in %.2fs",
+        server["name"],
+        time.monotonic() - started,
+    )
+    return new_client, False
+
+
+def invalidate_ssh_client(server, expected_client, cleanup_deadline=None):
+    key = get_ssh_cache_key(server)
+    removed = False
+    client_to_close = expected_client
 
     with ssh_lock:
-        if key in ssh_clients:
-            old = ssh_clients[key]
-            if old.get_transport() and old.get_transport().is_active():
-                new_client.close()
-                return old
-            try:
-                old.close()
-            except Exception:
-                pass
-        ssh_clients[key] = new_client
-        return new_client
+        cached_client = ssh_clients.get(key)
+        if cached_client is expected_client:
+            client_to_close = ssh_clients.pop(key)
+            removed = True
+
+    close_ssh_client(client_to_close, cleanup_deadline=cleanup_deadline)
+    return removed
 
 
-def invalidate_ssh_client(server):
-    key = (server["host"], server["port"], server["username"])
-    with ssh_lock:
-        if key in ssh_clients:
-            try:
-                ssh_clients[key].close()
-            except Exception:
-                pass
-            del ssh_clients[key]
+def is_retryable_ssh_transport_error(error):
+    if isinstance(error, SSHOperationDeadlineExceeded):
+        return False
+    if isinstance(error, paramiko.ssh_exception.NoValidConnectionsError):
+        return True
+    permanent_errors = (
+        paramiko.AuthenticationException,
+        paramiko.BadHostKeyException,
+        paramiko.PasswordRequiredException,
+        FileNotFoundError,
+        PermissionError,
+    )
+    if isinstance(error, permanent_errors):
+        return False
+    if error.__class__.__name__ == "IncompatiblePeer":
+        return False
+    if isinstance(error, paramiko.ChannelException):
+        return False
+    if isinstance(error, (TimeoutError, socket.timeout, EOFError, ConnectionError)):
+        return True
+    if isinstance(error, OSError):
+        return error.errno in {
+            errno.ECONNABORTED,
+            errno.ECONNRESET,
+            errno.EHOSTUNREACH,
+            errno.ENETDOWN,
+            errno.ENETUNREACH,
+            errno.EPIPE,
+            errno.ETIMEDOUT,
+        }
+    return isinstance(error, paramiko.SSHException)
 
 
-def run_ssh_command(client, command, timeout=SSH_COMMAND_TIMEOUT):
-    lock = getattr(client, "_command_lock", None)
-    if lock is not None:
-        with lock:
-            return _run_ssh_command_unlocked(client, command, timeout)
-    return _run_ssh_command_unlocked(client, command, timeout)
+def ensure_ssh_client_active(client):
+    if getattr(client, "_invalid", False):
+        raise paramiko.SSHException("SSH client was invalidated")
+    transport = client.get_transport()
+    if not transport or not transport.is_active() or not transport.is_authenticated():
+        client._invalid = True
+        raise paramiko.SSHException("SSH session is not active")
+    return transport
 
 
-def _run_ssh_command_unlocked(client, command, timeout):
-    stdin = stdout = stderr = None
+def run_cleanup_with_timeout(callback, timeout):
+    completed = threading.Event()
+
+    def cleanup_target():
+        try:
+            callback()
+        except Exception:
+            pass
+        finally:
+            completed.set()
+
+    thread = threading.Thread(
+        target=cleanup_target,
+        name="ssh-cleanup",
+        daemon=True,
+    )
     try:
-        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-        out = stdout.read().decode()
-        err = stderr.read().decode()
-        return out, err
-    finally:
-        for ch in (stdin, stdout, stderr):
-            if ch is not None:
-                try:
-                    ch.close()
-                except Exception:
-                    pass
+        thread.start()
+    except Exception as e:
+        logger.warning("Unable to start SSH cleanup thread: %s", e)
+        return False
+    return completed.wait(max(0.0, timeout))
 
 
-def run_ssh_command_status(client, command, timeout=SSH_COMMAND_TIMEOUT):
-    lock = getattr(client, "_command_lock", None)
-    if lock is not None:
-        with lock:
-            return _run_ssh_command_status_unlocked(client, command, timeout)
-    return _run_ssh_command_status_unlocked(client, command, timeout)
+def close_ssh_channel(
+    channel,
+    transport=None,
+    timeout=SSH_CLEANUP_TIMEOUT_SECONDS,
+    cleanup_deadline=None,
+):
+    if channel is None:
+        return True
+    close_timeout = get_ssh_cleanup_wait_timeout(cleanup_deadline, timeout)
+    if run_cleanup_with_timeout(channel.close, close_timeout):
+        return True
+    if transport is not None:
+        transport_timeout = get_ssh_cleanup_wait_timeout(
+            cleanup_deadline,
+            timeout,
+        )
+        run_cleanup_with_timeout(transport.close, transport_timeout)
+    return False
 
 
-def _run_ssh_command_status_unlocked(client, command, timeout):
-    stdin = stdout = stderr = None
+def open_ssh_session(
+    transport,
+    timeout,
+    deadline=None,
+    cleanup_deadline=None,
+    cleanup_timeout=SSH_CLEANUP_TIMEOUT_SECONDS,
+):
+    if cleanup_deadline is None:
+        cleanup_deadline = make_ssh_cleanup_deadline(deadline)
+    wait_timeout = cap_ssh_timeout(timeout, deadline, "SSH channel open")
+    completed = threading.Event()
+    abandoned = threading.Event()
+    results = []
+    errors = []
+
+    def open_session():
+        try:
+            channel = transport.open_session(timeout=wait_timeout)
+            if abandoned.is_set():
+                close_ssh_channel(
+                    channel,
+                    transport,
+                    cleanup_timeout,
+                    cleanup_deadline=cleanup_deadline,
+                )
+            else:
+                results.append(channel)
+        except Exception as e:
+            errors.append(e)
+        finally:
+            completed.set()
+
+    thread = threading.Thread(
+        target=open_session,
+        name="ssh-open-session",
+        daemon=True,
+    )
+    thread.start()
+
+    if not completed.wait(wait_timeout):
+        abandoned.set()
+        run_cleanup_with_timeout(
+            transport.close,
+            get_ssh_cleanup_wait_timeout(cleanup_deadline, cleanup_timeout),
+        )
+        completed.wait(
+            get_ssh_cleanup_wait_timeout(cleanup_deadline, cleanup_timeout)
+        )
+        raise TimeoutError(f"SSH channel open timeout after {wait_timeout:g}s")
+    if errors:
+        raise errors[0]
+    if not results:
+        raise paramiko.SSHException("SSH channel open returned no channel")
+    return results[0]
+
+
+def execute_ssh_channel_command(
+    channel,
+    command,
+    timeout,
+    transport=None,
+    deadline=None,
+    cleanup_deadline=None,
+    cleanup_timeout=SSH_CLEANUP_TIMEOUT_SECONDS,
+):
+    if cleanup_deadline is None:
+        cleanup_deadline = make_ssh_cleanup_deadline(deadline)
+    wait_timeout = cap_ssh_timeout(timeout, deadline, "SSH exec request")
+    completed = threading.Event()
+    errors = []
+
+    def execute():
+        try:
+            channel.exec_command(command)
+        except Exception as e:
+            errors.append(e)
+        finally:
+            completed.set()
+
+    thread = threading.Thread(
+        target=execute,
+        name="ssh-exec-request",
+        daemon=True,
+    )
+    thread.start()
+
+    if not completed.wait(wait_timeout):
+        close_ssh_channel(
+            channel,
+            transport,
+            cleanup_timeout,
+            cleanup_deadline=cleanup_deadline,
+        )
+        completed.wait(
+            get_ssh_cleanup_wait_timeout(cleanup_deadline, cleanup_timeout)
+        )
+        raise TimeoutError(f"SSH exec request timeout after {wait_timeout:g}s")
+    if errors:
+        raise errors[0]
+
+
+def read_ssh_channel(
+    channel,
+    idle_timeout,
+    total_timeout,
+    started_at=None,
+    deadline=None,
+):
+    stdout_chunks = []
+    stderr_chunks = []
+    started = started_at if started_at is not None else time.monotonic()
+    last_activity = time.monotonic()
+
+    while True:
+        received_data = False
+
+        for _ in range(16):
+            if not channel.recv_ready():
+                break
+            data = channel.recv(65536)
+            if not data:
+                break
+            stdout_chunks.append(data)
+            received_data = True
+            last_activity = time.monotonic()
+            get_ssh_deadline_remaining(deadline, "SSH command")
+            if (
+                total_timeout is not None
+                and last_activity - started >= total_timeout
+            ):
+                raise TimeoutError(
+                    f"SSH command total timeout after {total_timeout:g}s"
+                )
+
+        for _ in range(16):
+            if not channel.recv_stderr_ready():
+                break
+            data = channel.recv_stderr(65536)
+            if not data:
+                break
+            stderr_chunks.append(data)
+            received_data = True
+            last_activity = time.monotonic()
+            get_ssh_deadline_remaining(deadline, "SSH command")
+            if (
+                total_timeout is not None
+                and last_activity - started >= total_timeout
+            ):
+                raise TimeoutError(
+                    f"SSH command total timeout after {total_timeout:g}s"
+                )
+
+        now = time.monotonic()
+        get_ssh_deadline_remaining(deadline, "SSH command")
+        if received_data:
+            last_activity = now
+
+        stdout_ready = channel.recv_ready()
+        stderr_ready = channel.recv_stderr_ready()
+        if not stdout_ready and not stderr_ready:
+            if channel.closed or (
+                getattr(channel, "eof_received", False)
+                and channel.exit_status_ready()
+            ):
+                break
+
+        if total_timeout is not None and now - started >= total_timeout:
+            raise TimeoutError(
+                f"SSH command total timeout after {total_timeout:g}s"
+            )
+        if now - last_activity >= idle_timeout:
+            raise TimeoutError(
+                f"SSH command idle timeout after {idle_timeout:g}s"
+            )
+
+        remaining_idle = max(0.01, idle_timeout - (now - last_activity))
+        sleep_time = min(0.1, remaining_idle)
+        if total_timeout is not None:
+            remaining_total = max(0.01, total_timeout - (now - started))
+            sleep_time = min(sleep_time, remaining_total)
+        deadline_remaining = get_ssh_deadline_remaining(deadline, "SSH command")
+        if deadline_remaining is not None:
+            sleep_time = min(sleep_time, deadline_remaining)
+        time.sleep(sleep_time)
+
+    if not channel.exit_status_ready():
+        raise paramiko.SSHException("SSH channel closed without exit status")
+    status = channel.recv_exit_status()
+    return (
+        status,
+        b"".join(stdout_chunks).decode("utf-8", "replace"),
+        b"".join(stderr_chunks).decode("utf-8", "replace"),
+    )
+
+
+def run_ssh_command_status(
+    client,
+    command,
+    timeout=None,
+    channel_open_timeout=None,
+    total_timeout=None,
+    deadline=None,
+):
+    idle_timeout = timeout or getattr(
+        client, "_command_idle_timeout", SSH_COMMAND_TIMEOUT
+    )
+    open_timeout = channel_open_timeout or getattr(
+        client, "_channel_open_timeout", SSH_CHANNEL_OPEN_TIMEOUT
+    )
+    if total_timeout is None:
+        total_timeout = idle_timeout * 2
+    if deadline is None:
+        deadline = make_ssh_deadline(total_timeout)
+    cleanup_deadline = make_ssh_cleanup_deadline(deadline)
+
+    lock = getattr(client, "_command_lock", None) or threading.RLock()
+    acquire_until_deadline(lock, deadline, "SSH client command queue")
     try:
-        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-        out = stdout.read().decode()
-        err = stderr.read().decode()
-        status = stdout.channel.recv_exit_status()
-        return status, out, err
-    finally:
-        for ch in (stdin, stdout, stderr):
-            if ch is not None:
+        channel = None
+        transport = None
+        stage = SSH_STAGE_PRE_DISPATCH
+        try:
+            transport = ensure_ssh_client_active(client)
+            channel = open_ssh_session(
+                transport,
+                open_timeout,
+                deadline=deadline,
+                cleanup_deadline=cleanup_deadline,
+            )
+            channel.settimeout(
+                cap_ssh_timeout(idle_timeout, deadline, "SSH command idle")
+            )
+            command_started = time.monotonic()
+            exec_timeout = idle_timeout
+            if total_timeout is not None:
+                exec_timeout = min(exec_timeout, total_timeout)
+            stage = SSH_STAGE_DISPATCHED
+            execute_ssh_channel_command(
+                channel,
+                command,
+                exec_timeout,
+                transport=transport,
+                deadline=deadline,
+                cleanup_deadline=cleanup_deadline,
+            )
+            return read_ssh_channel(
+                channel,
+                idle_timeout,
+                total_timeout,
+                started_at=command_started,
+                deadline=deadline,
+            )
+        except SSHCommandFailure:
+            raise
+        except Exception as e:
+            if is_retryable_ssh_transport_error(e):
+                client._invalid = True
+            raise SSHCommandFailure(e, stage) from e
+        finally:
+            if channel is not None:
                 try:
-                    ch.close()
-                except Exception:
-                    pass
+                    closed = close_ssh_channel(
+                        channel,
+                        transport,
+                        cleanup_deadline=cleanup_deadline,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to schedule SSH channel cleanup: %s", e)
+                    closed = False
+                if not closed:
+                    client._invalid = True
+    finally:
+        lock.release()
+
+
+def run_ssh_command(
+    client,
+    command,
+    timeout=None,
+    channel_open_timeout=None,
+    total_timeout=None,
+    deadline=None,
+):
+    _, out, err = run_ssh_command_status(
+        client,
+        command,
+        timeout=timeout,
+        channel_open_timeout=channel_open_timeout,
+        total_timeout=total_timeout,
+        deadline=deadline,
+    )
+    return out, err
+
+
+def get_ssh_retry_delay(settings, retry_index):
+    base_delay = min(
+        settings["retry_backoff_max"],
+        settings["retry_backoff_base"] * (2 ** retry_index),
+    )
+    return base_delay + random.uniform(0, settings["retry_jitter"])
+
+
+def run_server_ssh_command_status(
+    server,
+    command,
+    *,
+    timeout=None,
+    channel_open_timeout=None,
+    total_timeout=None,
+    operation_timeout=None,
+    retry_on_transport=False,
+    operation_name="SSH command",
+):
+    if operation_timeout is None:
+        operation_timeout = SSH_OPERATION_TIMEOUT
+    deadline = make_ssh_deadline(operation_timeout)
+    cleanup_deadline = make_ssh_cleanup_deadline(deadline)
+    key = get_ssh_cache_key(server)
+    command_lock = get_ssh_command_lock(key)
+    settings = get_ssh_settings(server)
+    idle_timeout = timeout or settings["command_idle_timeout"]
+    open_timeout = channel_open_timeout or settings["channel_open_timeout"]
+    if total_timeout is None:
+        total_timeout = idle_timeout * 2
+    max_attempts = settings["retry_count"] + 1
+    acquire_until_deadline(command_lock, deadline, "SSH command queue")
+    try:
+        for attempt in range(max_attempts):
+            client = None
+            command_runner_entered = False
+            try:
+                client, was_reused = get_ssh_client(server, deadline=deadline)
+                attempt_open_timeout = open_timeout
+                if was_reused:
+                    attempt_open_timeout = min(
+                        attempt_open_timeout,
+                        settings["reused_channel_open_timeout"],
+                    )
+                command_runner_entered = True
+                return run_ssh_command_status(
+                    client,
+                    command,
+                    timeout=idle_timeout,
+                    channel_open_timeout=attempt_open_timeout,
+                    total_timeout=total_timeout,
+                    deadline=deadline,
+                )
+            except Exception as e:
+                if isinstance(e, SSHCommandFailure):
+                    cause = e.cause
+                    stage = e.stage
+                    transport_error = e.transport_error
+                else:
+                    cause = e
+                    stage = (
+                        SSH_STAGE_DISPATCHED
+                        if command_runner_entered
+                        else SSH_STAGE_PRE_DISPATCH
+                    )
+                    transport_error = is_retryable_ssh_transport_error(e)
+
+                if transport_error and client is not None:
+                    invalidate_ssh_client(
+                        server,
+                        expected_client=client,
+                        cleanup_deadline=cleanup_deadline,
+                    )
+
+                can_retry = (
+                    transport_error
+                    and attempt + 1 < max_attempts
+                    and (
+                        retry_on_transport
+                        or stage == SSH_STAGE_PRE_DISPATCH
+                    )
+                )
+                if can_retry:
+                    delay = get_ssh_retry_delay(settings, attempt)
+                    logger.warning(
+                        "%s failed for %s on attempt %s/%s: %s: %s; "
+                        "reconnecting in %.2fs",
+                        operation_name,
+                        server["name"],
+                        attempt + 1,
+                        max_attempts,
+                        cause.__class__.__name__,
+                        str(cause) or repr(cause),
+                        delay,
+                    )
+                    sleep_until_deadline(delay, deadline, "SSH retry backoff")
+                    continue
+
+                if stage == SSH_STAGE_DISPATCHED and not retry_on_transport:
+                    message = str(cause) or cause.__class__.__name__
+                    raise SSHCommandOutcomeUnknown(
+                        f"{message}; remote command outcome is unknown"
+                    ) from cause
+                if isinstance(e, SSHCommandFailure):
+                    raise cause from e
+                raise
+    finally:
+        command_lock.release()
+
+    raise RuntimeError("unreachable SSH retry state")
 
 
 def sanitize_error(error_msg):
@@ -568,15 +1462,7 @@ def import_user_keys(items):
 
 
 def get_servers_by_name():
-    config = load_config()
-    servers = config.get("servers", [])
-    if not isinstance(servers, list):
-        return {}
-    return {
-        server["name"]: server
-        for server in servers
-        if isinstance(server, dict) and isinstance(server.get("name"), str)
-    }
+    return {server["name"]: server for server in get_configured_servers()}
 
 
 def get_configured_servers():
@@ -584,17 +1470,22 @@ def get_configured_servers():
     servers = config.get("servers", [])
     if not isinstance(servers, list):
         return []
-    return [
-        server
-        for server in servers
-        if isinstance(server, dict) and isinstance(server.get("name"), str)
-    ]
+    configured = []
+    seen_names = set()
+    for server in servers:
+        if not isinstance(server, dict) or not isinstance(server.get("name"), str):
+            continue
+        name = server["name"]
+        if name in seen_names:
+            logger.error("Ignoring duplicate server name in config: %s", name)
+            continue
+        seen_names.add(name)
+        configured.append(server)
+    return configured
 
 
 def get_refresh_interval():
-    config = load_config()
-    interval = config.get("refresh_interval", 5)
-    return interval if isinstance(interval, (int, float)) else 5
+    return get_monitoring_settings()["refresh_interval"]
 
 
 def get_users_by_name():
@@ -747,9 +1638,14 @@ print(json.dumps(results, ensure_ascii=False))
 
 def configure_access_for_server(server, users):
     try:
-        client = get_ssh_client(server)
-        status, out, err = run_ssh_command_status(
-            client, build_configure_users_command(users), timeout=120
+        status, out, err = run_server_ssh_command_status(
+            server,
+            build_configure_users_command(users),
+            timeout=120,
+            total_timeout=240,
+            operation_timeout=360,
+            retry_on_transport=False,
+            operation_name="configure access",
         )
         if status != 0:
             message = err.strip() or out.strip() or "configure command failed"
@@ -762,7 +1658,6 @@ def configure_access_for_server(server, users):
         }
     except Exception as e:
         logger.error(f"Error configuring user access for {server['name']}: {e}")
-        invalidate_ssh_client(server)
         return {"server": server["name"], "error": sanitize_error(str(e)), "users": {}}
 
 
@@ -929,13 +1824,24 @@ print(json.dumps(results, ensure_ascii=False))
 
 def detect_users_for_server(server):
     try:
-        client = get_ssh_client(server)
-        status, out, err = run_ssh_command_status(
-            client, build_detect_users_command(use_sudo=True), timeout=45
+        status, out, err = run_server_ssh_command_status(
+            server,
+            build_detect_users_command(use_sudo=True),
+            timeout=60,
+            total_timeout=120,
+            operation_timeout=180,
+            retry_on_transport=True,
+            operation_name="detect users",
         )
         if status != 0:
-            status, out, err = run_ssh_command_status(
-                client, build_detect_users_command(use_sudo=False), timeout=45
+            status, out, err = run_server_ssh_command_status(
+                server,
+                build_detect_users_command(use_sudo=False),
+                timeout=60,
+                total_timeout=120,
+                operation_timeout=180,
+                retry_on_transport=True,
+                operation_name="detect users without sudo",
             )
         if status != 0:
             message = err.strip() or out.strip() or "detect users command failed"
@@ -950,7 +1856,6 @@ def detect_users_for_server(server):
         return {"server": server["name"], "error": None, "users": users}
     except Exception as e:
         logger.error(f"Error detecting users for {server['name']}: {e}")
-        invalidate_ssh_client(server)
         return {"server": server["name"], "error": sanitize_error(str(e)), "users": []}
 
 
@@ -1197,11 +2102,14 @@ print(json.dumps(result, ensure_ascii=False))
 
 def revoke_user_on_server(server, username, ssh_keys, mode, clear_authorized_keys, remove_home):
     try:
-        client = get_ssh_client(server)
-        status, out, err = run_ssh_command_status(
-            client,
+        status, out, err = run_server_ssh_command_status(
+            server,
             build_revoke_user_command(username, ssh_keys, mode, clear_authorized_keys, remove_home),
             timeout=120,
+            total_timeout=240,
+            operation_timeout=360,
+            retry_on_transport=False,
+            operation_name="revoke user access",
         )
         if status != 0:
             message = err.strip() or out.strip() or "revoke user command failed"
@@ -1209,7 +2117,6 @@ def revoke_user_on_server(server, username, ssh_keys, mode, clear_authorized_key
         return {"server": server["name"], "error": None, "result": json.loads(out)}
     except Exception as e:
         logger.error(f"Error revoking user {username} for {server['name']}: {e}")
-        invalidate_ssh_client(server)
         return {"server": server["name"], "error": sanitize_error(str(e)), "result": {}}
 
 
@@ -1347,13 +2254,24 @@ print(json.dumps(results))
 def check_access_matrix_for_server(server, users):
     usernames = [user["username"] for user in users]
     try:
-        client = get_ssh_client(server)
-        status, out, err = run_ssh_command_status(
-            client, build_access_check_command(usernames, use_sudo=True), timeout=30
+        status, out, err = run_server_ssh_command_status(
+            server,
+            build_access_check_command(usernames, use_sudo=True),
+            timeout=60,
+            total_timeout=120,
+            operation_timeout=180,
+            retry_on_transport=True,
+            operation_name="check access matrix",
         )
         if status != 0:
-            status, out, err = run_ssh_command_status(
-                client, build_access_check_command(usernames, use_sudo=False), timeout=30
+            status, out, err = run_server_ssh_command_status(
+                server,
+                build_access_check_command(usernames, use_sudo=False),
+                timeout=60,
+                total_timeout=120,
+                operation_timeout=180,
+                retry_on_transport=True,
+                operation_name="check access matrix without sudo",
             )
         if status != 0:
             message = err.strip() or out.strip() or "access check command failed"
@@ -1363,7 +2281,6 @@ def check_access_matrix_for_server(server, users):
         return {"server": server["name"], "error": None, "users": remote_users}
     except Exception as e:
         logger.error(f"Error checking user access for {server['name']}: {e}")
-        invalidate_ssh_client(server)
         return {"server": server["name"], "error": sanitize_error(str(e)), "users": {}}
 
 
@@ -1652,10 +2569,14 @@ def apply_process_users(ps_output, gpus):
 
 def get_gpu_info_ssh(server):
     try:
-        client = get_ssh_client(server)
-
-        status, out, err = run_ssh_command_status(
-            client, build_gpu_info_command(), timeout=SSH_COMMAND_TIMEOUT
+        monitoring_settings = get_monitoring_settings()
+        status, out, err = run_server_ssh_command_status(
+            server,
+            build_gpu_info_command(),
+            total_timeout=monitoring_settings["gpu_command_total_timeout"],
+            operation_timeout=monitoring_settings["gpu_operation_timeout"],
+            retry_on_transport=True,
+            operation_name="GPU query",
         )
         gpu_out = extract_marked_section(out, GPU_INFO_GPU_START, GPU_INFO_GPU_END)
         if status != 0 or not gpu_out.strip():
@@ -1701,15 +2622,104 @@ def get_gpu_info_ssh(server):
     except Exception as e:
         error_message = str(e) or e.__class__.__name__
         logger.error(f"Error getting GPU info for {server['name']}: {error_message}")
-        invalidate_ssh_client(server)
         return {"error": sanitize_error(error_message), "server": server["name"]}
 
 
-def refresh_data():
-    global cached_data, last_update
+def make_waiting_gpu_result(server_name):
+    return {
+        "server": server_name,
+        "error": "Waiting for first sample",
+        "stale": False,
+        "updated_at": None,
+        "last_error": None,
+    }
 
+
+def merge_gpu_result(previous, result, now=None):
+    now = time.time() if now is None else now
+    merged_result = copy.deepcopy(result)
+    error = merged_result.get("error")
+    is_success = error is None and "gpus" in merged_result
+
+    if is_success:
+        merged_result["stale"] = False
+        merged_result["updated_at"] = now
+        merged_result["last_error"] = None
+        return merged_result
+
+    if error is None:
+        error = "Invalid GPU result"
+        merged_result["error"] = error
+
+    has_previous_success = (
+        isinstance(previous, dict)
+        and "gpus" in previous
+        and previous.get("error") is None
+    )
+    if has_previous_success:
+        stale_result = copy.deepcopy(previous)
+        stale_result["error"] = None
+        stale_result["stale"] = True
+        stale_result["last_error"] = error
+        return stale_result
+
+    merged_result["stale"] = False
+    merged_result["updated_at"] = None
+    merged_result["last_error"] = error
+    return merged_result
+
+
+def get_gpu_cache_identity(server):
+    return (
+        server.get("host"),
+        server.get("port"),
+        server.get("username"),
+    )
+
+
+def initialize_gpu_cache(servers):
+    global cached_data, cached_server_identities
+    current_identities = {
+        server["name"]: get_gpu_cache_identity(server)
+        for server in servers
+    }
+    ordered_names = sorted(current_identities)
+    with data_lock:
+        existing = {item["server"]: item for item in cached_data}
+        cached_data = [
+            existing.get(name, make_waiting_gpu_result(name))
+            if cached_server_identities.get(name) == current_identities[name]
+            else make_waiting_gpu_result(name)
+            for name in ordered_names
+        ]
+        cached_server_identities = current_identities
+
+
+def publish_gpu_result(result, server_names):
+    global cached_data, last_update
+    server_name = result["server"]
+    ordered_names = sorted(server_names)
+    now = time.time()
+
+    with data_lock:
+        current = {item["server"]: item for item in cached_data}
+        current[server_name] = merge_gpu_result(
+            current.get(server_name),
+            result,
+            now=now,
+        )
+        cached_data = [
+            current.get(name, make_waiting_gpu_result(name))
+            for name in ordered_names
+        ]
+        last_update = now
+
+
+def refresh_data():
     servers = get_configured_servers()
-    results = []
+    server_names = [server["name"] for server in servers]
+    initialize_gpu_cache(servers)
+    completed = 0
 
     futures = {
         gpu_executor.submit(get_gpu_info_ssh, server): server
@@ -1717,19 +2727,18 @@ def refresh_data():
     }
     for future in as_completed(futures):
         try:
-            results.append(future.result())
+            result = future.result()
         except Exception as e:
             server = futures[future]
             logger.error(f"Unexpected error for {server['name']}: {e}")
-            results.append({"error": sanitize_error(str(e)), "server": server["name"]})
+            result = {
+                "error": sanitize_error(str(e)),
+                "server": server["name"],
+            }
+        publish_gpu_result(result, server_names)
+        completed += 1
 
-    results.sort(key=lambda x: x["server"])
-
-    with data_lock:
-        cached_data = results
-        last_update = time.time()
-
-    logger.info(f"Refreshed data for {len(results)} servers")
+    logger.info(f"Refreshed data for {completed} servers")
 
 
 def background_worker():
@@ -1756,8 +2765,13 @@ def get_gpu():
 @app.route("/api/servers")
 def get_servers():
     servers = [{"name": s["name"]} for s in get_configured_servers()]
+    monitoring_settings = get_monitoring_settings()
     return jsonify(
-        {"servers": servers, "refresh_interval": get_refresh_interval()}
+        {
+            "servers": servers,
+            "refresh_interval": monitoring_settings["refresh_interval"],
+            "poll_interval": monitoring_settings["api_poll_interval"],
+        }
     )
 
 

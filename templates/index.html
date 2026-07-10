@@ -515,6 +515,18 @@
             border: 1px solid #f14c4c;
         }
 
+        .status.stale {
+            background: #3c3c3c;
+            color: #dcdcaa;
+            border: 1px solid #dcdcaa;
+        }
+
+        .stale-warning {
+            margin: 8px 12px 0;
+            color: #dcdcaa;
+            font-size: 0.78em;
+        }
+
         .server-summary-meta,
         .gpu-summary-meta {
             display: flex;
@@ -785,11 +797,12 @@
             </details>
         </div>
         <div class="servers" id="servers">Loading...</div>
-        <div class="refresh-info">Refresh: <span id="interval">-</span>s | Last: <span id="last-update">-</span></div>
+        <div class="refresh-info">Refresh: <span id="interval">-</span>s | Sample: <span id="last-update">-</span></div>
     </div>
     
     <script>
-        let refreshInterval = 5;
+        let refreshInterval = 30;
+        let apiPollInterval = 5;
         let configuredServers = [];
         let latestAccessMatrix = null;
         let latestDetectedUserItems = [];
@@ -930,7 +943,8 @@
             try {
                 const r = await fetch('/api/servers');
                 const cfg = await r.json();
-                refreshInterval = cfg.refresh_interval || 5;
+                refreshInterval = cfg.refresh_interval || 30;
+                apiPollInterval = cfg.poll_interval || 5;
                 renderAccessServerFilter(cfg.servers || []);
                 document.getElementById('interval').textContent = refreshInterval;
             } catch(e) {
@@ -939,7 +953,7 @@
             }
             
             await refresh();
-            setInterval(refresh, refreshInterval * 1000);
+            setInterval(refresh, apiPollInterval * 1000);
         }
         
         async function refresh() {
@@ -947,7 +961,12 @@
                 const r = await fetch('/api/gpu');
                 const data = await r.json();
                 render(data);
-                document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+                const sampleTimes = data
+                    .map(server => Number(server.updated_at))
+                    .filter(timestamp => Number.isFinite(timestamp) && timestamp > 0);
+                document.getElementById('last-update').textContent = sampleTimes.length
+                    ? new Date(Math.max(...sampleTimes) * 1000).toLocaleString()
+                    : '-';
             } catch(e) {
                 const serversDiv = document.getElementById('servers');
                 serversDiv.innerHTML = '';
@@ -1787,7 +1806,9 @@
                     errorDiv.textContent = s.error;
                     serverCard.appendChild(errorDiv);
                 } else {
-                    online++;
+                    if (!s.stale) {
+                        online++;
+                    }
                     if (s.host) {
                         const serverHost = document.createElement('div');
                         serverHost.className = 'server-host';
@@ -1796,8 +1817,11 @@
                     }
                     
                     const status = document.createElement('span');
-                    status.className = 'status online';
-                    status.textContent = 'Online';
+                    status.className = s.stale ? 'status stale' : 'status online';
+                    status.textContent = s.stale ? 'Stale' : 'Online';
+                    if (s.stale && s.last_error) {
+                        status.title = s.last_error;
+                    }
                     serverHeader.appendChild(serverInfo);
                     const serverMeta = document.createElement('div');
                     serverMeta.className = 'server-summary-meta';
@@ -1813,6 +1837,16 @@
                     serverHeader.appendChild(serverMeta);
                     serverSummary.appendChild(serverHeader);
                     serverCard.appendChild(serverSummary);
+
+                    if (s.stale) {
+                        const staleWarning = document.createElement('div');
+                        staleWarning.className = 'stale-warning';
+                        const updatedAt = s.updated_at
+                            ? new Date(s.updated_at * 1000).toLocaleString()
+                            : 'unknown';
+                        staleWarning.textContent = 'Showing last successful sample (' + updatedAt + '): ' + (s.last_error || 'latest refresh failed');
+                        serverCard.appendChild(staleWarning);
+                    }
                     
                     const gpuList = document.createElement('div');
                     gpuList.className = 'gpu-list';
