@@ -586,6 +586,34 @@ class GPUCollectorManagerTests(unittest.TestCase):
             self.assertTrue(new_alpha.publish_callback(new_alpha, new_result))
             publish.assert_called_once_with(new_result, ["alpha"])
 
+    def test_reconcile_replaces_collector_when_refresh_interval_changes(self):
+        server = make_server("alpha")
+        manager = app.GPUCollectorManager(collector_factory=FakeCollector)
+
+        with (
+            patch.object(
+                app,
+                "get_gpu_collector_signature",
+                side_effect=collector_signature,
+            ),
+            patch.object(app, "initialize_gpu_cache"),
+        ):
+            manager.reconcile_once(
+                [server],
+                monitoring_settings(refresh_interval=5),
+            )
+            old_collector = manager.collectors["alpha"]
+            manager.reconcile_once(
+                [server],
+                monitoring_settings(refresh_interval=2),
+            )
+
+        new_collector = manager.collectors["alpha"]
+        self.assertIsNot(new_collector, old_collector)
+        self.assertTrue(old_collector.stopped)
+        self.assertTrue(new_collector.started)
+        self.assertEqual(new_collector.settings["refresh_interval"], 2)
+
     def test_each_server_gets_an_independent_thread_without_gpu_executor(self):
         servers = [make_server(f"gpu-{index}") for index in range(9)]
         settings = monitoring_settings()

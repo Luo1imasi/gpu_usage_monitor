@@ -801,8 +801,8 @@
     </div>
     
     <script>
-        let refreshInterval = 30;
-        let apiPollInterval = 5;
+        let refreshInterval = 2;
+        let apiPollInterval = 2;
         let configuredServers = [];
         let latestAccessMatrix = null;
         let latestDetectedUserItems = [];
@@ -943,8 +943,8 @@
             try {
                 const r = await fetch('/api/servers');
                 const cfg = await r.json();
-                refreshInterval = cfg.refresh_interval || 30;
-                apiPollInterval = cfg.poll_interval || 5;
+                refreshInterval = cfg.refresh_interval || 2;
+                apiPollInterval = cfg.poll_interval || 2;
                 renderAccessServerFilter(cfg.servers || []);
                 document.getElementById('interval').textContent = refreshInterval;
             } catch(e) {

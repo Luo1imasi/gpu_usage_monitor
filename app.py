@@ -263,7 +263,7 @@ def get_monitoring_settings():
             settings,
             "refresh_interval_seconds",
             legacy_refresh_interval,
-            5,
+            1,
             3600,
         ),
         "gpu_command_total_timeout": get_bounded_number(

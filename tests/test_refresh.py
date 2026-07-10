@@ -36,6 +36,38 @@ class FakeExecutor:
         return future
 
 
+class MonitoringSettingsTests(unittest.TestCase):
+    def test_two_second_sample_and_api_intervals_are_accepted(self):
+        with patch.object(
+            app,
+            "load_config",
+            return_value={
+                "monitoring": {
+                    "refresh_interval_seconds": 2,
+                    "api_poll_interval_seconds": 2,
+                }
+            },
+        ):
+            settings = app.get_monitoring_settings()
+
+        self.assertEqual(settings["refresh_interval"], 2)
+        self.assertEqual(settings["api_poll_interval"], 2)
+
+    def test_sample_interval_is_clamped_to_one_second(self):
+        with patch.object(
+            app,
+            "load_config",
+            return_value={
+                "monitoring": {
+                    "refresh_interval_seconds": 0.1,
+                }
+            },
+        ):
+            settings = app.get_monitoring_settings()
+
+        self.assertEqual(settings["refresh_interval"], 1)
+
+
 class GPUCacheTests(unittest.TestCase):
     def setUp(self):
         with app.data_lock:
