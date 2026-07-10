@@ -22,10 +22,13 @@ cp config.example.json config.json
 {
   "admin_token": "change-me",
   "monitoring": {
-    "refresh_interval_seconds": 30,
+    "refresh_interval_seconds": 5,
     "gpu_command_total_timeout_seconds": 90,
     "gpu_operation_timeout_seconds": 150,
-    "api_poll_interval_seconds": 5
+    "api_poll_interval_seconds": 5,
+    "collector_mode": "stream",
+    "collector_reconcile_interval_seconds": 2,
+    "collector_retry_backoff_max_seconds": 60
   },
   "ssh": {
     "connect_timeout_seconds": 30,
@@ -55,7 +58,9 @@ cp config.example.json config.json
 }
 ```
 
-`monitoring.refresh_interval_seconds` 是一轮查询全部完成后的等待时间，不是固定频率。`gpu_command_total_timeout_seconds` 是单次远端命令的子预算，`gpu_operation_timeout_seconds` 是包含排队、建连、重试在内的单服务器总预算；超时后的异步资源清理最多允许 1 秒共享宽限期。前端通过 `api_poll_interval_seconds` 更快读取逐服务器更新的内存缓存，页面显示的是最新样本时间而不是轮询时间。
+默认 `collector_mode=stream`：每台服务器拥有独立采集线程、专用 SSH Transport 和一个长生命周期 Channel。本地按 `refresh_interval_seconds` 为该服务器安排下一次采样；若上一次尚未完成则不并发、不补发，完成后立即进入下一次。慢服务器不会阻塞其他服务器。远端只运行随 SSH Channel 存活的 shell，不安装服务、不写文件，断线后由 sshd 回收。`poll` 模式保留独立调度但每次重新执行命令，`batch` 模式保留旧的整批查询逻辑（切换 `batch` 后需重启进程）。
+
+`gpu_command_total_timeout_seconds` 是单次远端采样的子预算，`gpu_operation_timeout_seconds` 是包含排队、建连和 Channel 启动在内的单服务器预算；超时后的异步资源清理最多允许 1 秒共享宽限期。采集器断线按指数退避，最大值由 `collector_retry_backoff_max_seconds` 控制。前端通过 `api_poll_interval_seconds` 读取逐服务器更新的内存缓存，页面显示的是最新样本时间而不是轮询时间。
 
 SSH timeout 均以秒为单位：建连、banner、认证、Channel 打开和命令空闲等待分别配置。只读查询遇到瞬态传输错误时最多安全重连一次，并带随机退避；用户配置、撤权和删账号等写操作在命令可能已经发出后不会自动重放。单台服务器可通过自己的 `ssh` 对象覆盖全局 SSH 参数。
 
@@ -83,7 +88,7 @@ FLASK_DEBUG=true python app.py
 
 - 实时显示 GPU 利用率和显存使用情况
 - 显示占用 GPU 的进程及用户
-- 自动刷新（默认 30 秒）
+- 每服务器独立常驻采集（默认目标周期 5 秒）
 - 支持多服务器监控
-- SSH 连接复用、保活、限流和瞬态错误安全重试
+- 专用 SSH 常驻 Channel、连接复用、保活、限流和单服务器独立重连
 - 前端 XSS 防护

@@ -1,10 +1,13 @@
 {
   "admin_token": "change-me",
   "monitoring": {
-    "refresh_interval_seconds": 30,
+    "refresh_interval_seconds": 5,
     "gpu_command_total_timeout_seconds": 90,
     "gpu_operation_timeout_seconds": 150,
-    "api_poll_interval_seconds": 5
+    "api_poll_interval_seconds": 5,
+    "collector_mode": "stream",
+    "collector_reconcile_interval_seconds": 2,
+    "collector_retry_backoff_max_seconds": 60
   },
   "ssh": {
     "connect_timeout_seconds": 30,

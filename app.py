@@ -9,6 +9,8 @@ import json
 import os
 import random
 import re
+import secrets
+import shlex
 import socket
 import time
 import threading
@@ -55,10 +57,15 @@ SSH_RETRY_BACKOFF_BASE_SECONDS = 2
 SSH_RETRY_BACKOFF_MAX_SECONDS = 4
 SSH_RETRY_JITTER_SECONDS = 2
 SSH_CONNECT_JITTER_SECONDS = 1.5
-SSH_CONNECT_MAX_CONCURRENCY = 3
+SSH_CONNECT_MAX_CONCURRENCY = 8
 SSH_CLEANUP_TIMEOUT_SECONDS = 1
 SSH_CLEANUP_GRACE_SECONDS = 1
-GPU_MAX_WORKERS = 5
+GPU_MAX_WORKERS = 8
+GPU_COLLECTOR_RECONCILE_SECONDS = 2
+GPU_COLLECTOR_RETRY_BACKOFF_MAX_SECONDS = 60
+GPU_COLLECTOR_FRAME_MAX_BYTES = 4 * 1024 * 1024
+GPU_COLLECTOR_HEADER_MAX_BYTES = 512
+GPU_COLLECTOR_STDERR_TAIL_BYTES = 8 * 1024
 ADMIN_MAX_WORKERS = 4
 API_POLL_INTERVAL_SECONDS = 5
 ACCESS_MATRIX_CACHE_TTL = 30
@@ -78,46 +85,57 @@ ssh_lock = threading.Lock()
 ssh_connect_semaphore = threading.BoundedSemaphore(SSH_CONNECT_MAX_CONCURRENCY)
 access_matrix_cache = {}
 access_matrix_cache_lock = threading.Lock()
+gpu_collector_manager = None
+shutdown_event = threading.Event()
 
 _config_cache = None
-_config_mtime = 0.0
+_config_signature = None
 
 
 def cleanup():
+    global gpu_collector_manager
     logger.info("Cleaning up resources...")
+    shutdown_event.set()
+    if gpu_collector_manager is not None:
+        gpu_collector_manager.stop()
     gpu_executor.shutdown(wait=False)
     admin_executor.shutdown(wait=False)
     with ssh_lock:
-        for client in ssh_clients.values():
-            try:
-                client.close()
-            except Exception as e:
-                logger.debug(f"Error closing SSH client: {e}")
+        clients = list(ssh_clients.values())
         ssh_clients.clear()
         ssh_connect_locks.clear()
         ssh_command_locks.clear()
+    for client in clients:
+        try:
+            client.close()
+        except Exception as e:
+            logger.debug(f"Error closing SSH client: {e}")
 
 
 atexit.register(cleanup)
 
 
 def load_config():
-    global _config_cache, _config_mtime
+    global _config_cache, _config_signature
     try:
-        mtime = CONFIG_PATH.stat().st_mtime
-        if _config_cache is not None and mtime == _config_mtime:
+        stat = CONFIG_PATH.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+        if _config_cache is not None and signature == _config_signature:
             return _config_cache
         with open(CONFIG_PATH) as f:
-            _config_cache = json.load(f)
-            _config_mtime = mtime
+            config = json.load(f)
+            if not isinstance(config, dict):
+                raise ValueError("Config root must be an object")
+            _config_cache = config
+            _config_signature = signature
             invalidate_access_matrix_cache()
             return _config_cache
     except FileNotFoundError:
         logger.error(f"Config file not found: {CONFIG_PATH}")
-        return {"servers": [], "refresh_interval": 30}
-    except json.JSONDecodeError as e:
+        return _config_cache or {"servers": [], "refresh_interval": 30}
+    except (json.JSONDecodeError, ValueError) as e:
         logger.error(f"Invalid JSON in config file: {e}")
-        return {"servers": [], "refresh_interval": 30}
+        return _config_cache or {"servers": [], "refresh_interval": 30}
 
 
 def get_bounded_number(source, key, default, minimum, maximum, integer=False):
@@ -236,6 +254,10 @@ def get_monitoring_settings():
     ):
         legacy_refresh_interval = 30
 
+    collector_mode = settings.get("collector_mode", "stream")
+    if collector_mode not in {"stream", "poll", "batch"}:
+        collector_mode = "stream"
+
     return {
         "refresh_interval": get_bounded_number(
             settings,
@@ -264,6 +286,21 @@ def get_monitoring_settings():
             API_POLL_INTERVAL_SECONDS,
             1,
             60,
+        ),
+        "collector_mode": collector_mode,
+        "collector_reconcile_interval": get_bounded_number(
+            settings,
+            "collector_reconcile_interval_seconds",
+            GPU_COLLECTOR_RECONCILE_SECONDS,
+            0.5,
+            60,
+        ),
+        "collector_retry_backoff_max": get_bounded_number(
+            settings,
+            "collector_retry_backoff_max_seconds",
+            GPU_COLLECTOR_RETRY_BACKOFF_MAX_SECONDS,
+            2,
+            600,
         ),
     }
 
@@ -353,8 +390,11 @@ def sleep_until_deadline(delay, deadline, label):
     time.sleep(delay)
 
 
-def get_ssh_cache_key(server):
-    return server["host"], server["port"], server["username"]
+def get_ssh_cache_key(server, namespace=None):
+    key = (server["host"], server["port"], server["username"])
+    if namespace is None:
+        return key
+    return (*key, namespace)
 
 
 def get_ssh_connection_identity(server):
@@ -434,8 +474,8 @@ def get_cached_ssh_client(key, identity, cleanup_deadline=None):
     return None
 
 
-def get_ssh_client(server, deadline=None):
-    key = get_ssh_cache_key(server)
+def get_ssh_client(server, deadline=None, namespace=None):
+    key = get_ssh_cache_key(server, namespace=namespace)
     identity = get_ssh_connection_identity(server)
     cleanup_deadline = make_ssh_cleanup_deadline(deadline)
     client = get_cached_ssh_client(
@@ -629,8 +669,13 @@ def create_ssh_client(
     return new_client, False
 
 
-def invalidate_ssh_client(server, expected_client, cleanup_deadline=None):
-    key = get_ssh_cache_key(server)
+def invalidate_ssh_client(
+    server,
+    expected_client,
+    cleanup_deadline=None,
+    namespace=None,
+):
+    key = get_ssh_cache_key(server, namespace=namespace)
     removed = False
     client_to_close = expected_client
 
@@ -2539,6 +2584,166 @@ exit "$gpu_status"
 """.strip()
 
 
+def build_gpu_collector_command(nonce, sample_timeout):
+    gpu_fields = "index,gpu_bus_id,name,utilization.gpu,memory.used,memory.total"
+    app_fields = "gpu_bus_id,pid,used_gpu_memory"
+    sample_timeout = max(1, int(sample_timeout))
+    script = f"""
+LC_ALL=C
+export LC_ALL
+nonce={shlex.quote(nonce)}
+gpu_fields={shlex.quote(gpu_fields)}
+app_fields={shlex.quote(app_fields)}
+sample_timeout={sample_timeout}
+has_timeout=0
+if command -v timeout >/dev/null 2>&1; then
+    has_timeout=1
+fi
+run_limited() {{
+    if [ "$has_timeout" = "1" ]; then
+        timeout "$sample_timeout" "$@"
+    else
+        "$@"
+    fi
+}}
+trap 'exit 0' HUP INT TERM PIPE
+printf '\\036GUM1|%s|READY|1\\n' "$nonce" || exit 1
+while IFS= read -r request; do
+    case "$request" in
+        QUIT)
+            printf '\\036GUM1|%s|BYE\\n' "$nonce"
+            break
+            ;;
+        POLL\\|*)
+            seq="${{request#POLL|}}"
+            case "$seq" in
+                ''|*[!0-9]*) continue ;;
+            esac
+            ;;
+        *)
+            continue
+            ;;
+    esac
+
+    gpu_capture="$(run_limited nvidia-smi "--query-gpu=$gpu_fields" --format=csv,noheader,nounits 2>&1)"
+    gpu_status=$?
+    gpu_output=""
+    gpu_error=""
+    if [ "$gpu_status" -eq 0 ]; then
+        gpu_output="$gpu_capture"
+    else
+        gpu_error="$gpu_capture"
+    fi
+
+    apps=""
+    if [ "$gpu_status" -eq 0 ]; then
+        has_gpu_memory="$(printf '%s\\n' "$gpu_output" | awk -F, '{{gsub(/^[ \\t]+|[ \\t]+$/, "", $5); if (($5 + 0) > 0) {{print "1"; exit}}}}')"
+        if [ "$has_gpu_memory" = "1" ]; then
+            apps="$(run_limited nvidia-smi "--query-compute-apps=$app_fields" --format=csv,noheader 2>/dev/null || true)"
+        fi
+    fi
+
+    ps_output=""
+    pids="$(printf '%s\\n' "$apps" | awk -F, '{{gsub(/^[ \\t]+|[ \\t]+$/, "", $2); if ($2 ~ /^[0-9]+$/) {{printf "%s%s", sep, $2; sep=","}}}}')"
+    if [ -n "$pids" ]; then
+        ps_output="$(ps -o pid=,user= -p "$pids" 2>/dev/null || true)"
+    fi
+
+    epoch="$(date +%s 2>/dev/null || printf 0)"
+    printf '\\036GUM1|%s|DATA|%s|%s|%s|%s|%s|%s|%s\\n' \\
+        "$nonce" "$seq" "$epoch" "$gpu_status" \\
+        "${{#gpu_output}}" "${{#apps}}" "${{#ps_output}}" "${{#gpu_error}}" || exit 1
+    printf '%s%s%s%s' "$gpu_output" "$apps" "$ps_output" "$gpu_error" || exit 1
+    printf '\\036GUM1|%s|END|%s\\n' "$nonce" "$seq" || exit 1
+done
+""".strip()
+    return "sh -c " + shlex.quote(script)
+
+
+class GPUStreamFrameParser:
+    def __init__(self, nonce):
+        self.reset(nonce)
+
+    def reset(self, nonce):
+        if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce):
+            raise ValueError("Invalid GPU collector nonce")
+        self.nonce = nonce
+        self.buffer = bytearray()
+        self.data_prefix = f"\x1eGUM1|{nonce}|DATA|".encode("ascii")
+
+    def feed(self, data):
+        if data:
+            self.buffer.extend(data)
+        frames = []
+
+        while True:
+            start = self.buffer.find(self.data_prefix)
+            if start < 0:
+                if len(self.buffer) > GPU_COLLECTOR_FRAME_MAX_BYTES:
+                    raise ValueError("GPU collector frame prefix not found")
+                keep = max(0, len(self.data_prefix) - 1)
+                if len(self.buffer) > keep:
+                    del self.buffer[:-keep]
+                break
+            if start:
+                del self.buffer[:start]
+
+            header_end = self.buffer.find(b"\n")
+            if header_end < 0:
+                if len(self.buffer) > GPU_COLLECTOR_HEADER_MAX_BYTES:
+                    raise ValueError("GPU collector frame header is too large")
+                break
+            if header_end > GPU_COLLECTOR_HEADER_MAX_BYTES:
+                raise ValueError("GPU collector frame header is too large")
+
+            fields = bytes(
+                self.buffer[len(self.data_prefix):header_end]
+            ).split(b"|")
+            if len(fields) != 7:
+                raise ValueError("Invalid GPU collector frame header")
+            try:
+                seq, epoch, status, gpu_len, apps_len, ps_len, error_len = (
+                    int(field) for field in fields
+                )
+            except ValueError as e:
+                raise ValueError("Invalid GPU collector frame number") from e
+            if min(seq, epoch, status, gpu_len, apps_len, ps_len, error_len) < 0:
+                raise ValueError("Negative GPU collector frame number")
+
+            lengths = (gpu_len, apps_len, ps_len, error_len)
+            payload_length = sum(lengths)
+            if payload_length > GPU_COLLECTOR_FRAME_MAX_BYTES:
+                raise ValueError("GPU collector frame is too large")
+            payload_start = header_end + 1
+            payload_end = payload_start + payload_length
+            footer = f"\x1eGUM1|{self.nonce}|END|{seq}\n".encode("ascii")
+            frame_end = payload_end + len(footer)
+            if len(self.buffer) < frame_end:
+                break
+            if bytes(self.buffer[payload_end:frame_end]) != footer:
+                raise ValueError("Invalid GPU collector frame footer")
+
+            cursor = payload_start
+            segments = []
+            for length in lengths:
+                segments.append(bytes(self.buffer[cursor:cursor + length]))
+                cursor += length
+            del self.buffer[:frame_end]
+            frames.append(
+                {
+                    "seq": seq,
+                    "epoch": epoch,
+                    "status": status,
+                    "gpu": segments[0],
+                    "apps": segments[1],
+                    "ps": segments[2],
+                    "error": segments[3],
+                }
+            )
+
+        return frames
+
+
 def extract_marked_section(output, start_marker, end_marker):
     start = output.find(start_marker)
     if start == -1:
@@ -2567,6 +2772,54 @@ def apply_process_users(ps_output, gpus):
                 proc["user"] = user_map[str(proc["pid"])]
 
 
+def build_gpu_result(
+    server,
+    status,
+    gpu_output,
+    apps_output="",
+    ps_output="",
+    error_output="",
+):
+    if status != 0 or not gpu_output.strip():
+        error_msg = error_output.strip() or "No GPU info returned"
+        logger.error("nvidia-smi error on %s: %s", server["name"], error_msg)
+        return {"error": sanitize_error(error_msg), "server": server["name"]}
+
+    gpus, bus_to_idx = parse_gpu_query(gpu_output)
+    parse_compute_apps(apps_output, bus_to_idx, gpus)
+    apply_process_users(ps_output, gpus)
+
+    for gpu in gpus.values():
+        user_memory = {}
+        for proc in gpu["processes"]:
+            user = proc["user"]
+            if user not in user_memory:
+                user_memory[user] = 0
+            user_memory[user] += proc["memory"]
+
+        total_proc_mem = sum(user_memory.values())
+        if total_proc_mem > 0 and gpu["memory_used"] > 0:
+            ratio = gpu["memory_used"] / total_proc_mem
+            if ratio > 1.5:
+                if len(user_memory) == 1:
+                    user_memory[list(user_memory.keys())[0]] = gpu["memory_used"]
+                else:
+                    for user in user_memory:
+                        proportion = user_memory[user] / total_proc_mem
+                        user_memory[user] = int(gpu["memory_used"] * proportion)
+
+        gpu["processes"] = [
+            {"user": user, "memory": memory}
+            for user, memory in user_memory.items()
+        ]
+
+    return {
+        "server": server["name"],
+        "gpus": sorted(gpus.values(), key=lambda item: item["index"]),
+        "error": None,
+    }
+
+
 def get_gpu_info_ssh(server):
     try:
         monitoring_settings = get_monitoring_settings()
@@ -2578,50 +2831,17 @@ def get_gpu_info_ssh(server):
             retry_on_transport=True,
             operation_name="GPU query",
         )
-        gpu_out = extract_marked_section(out, GPU_INFO_GPU_START, GPU_INFO_GPU_END)
-        if status != 0 or not gpu_out.strip():
-            error_msg = err.strip() if err else "No GPU info returned"
-            logger.error(f"nvidia-smi error on {server['name']}: {error_msg}")
-            return {"error": sanitize_error(error_msg), "server": server["name"]}
-
-        gpus, bus_to_idx = parse_gpu_query(gpu_out)
-        proc_out = extract_marked_section(out, GPU_INFO_APPS_START, GPU_INFO_APPS_END)
-        parse_compute_apps(proc_out, bus_to_idx, gpus)
-
-        ps_out = extract_marked_section(out, GPU_INFO_PS_START, GPU_INFO_PS_END)
-        apply_process_users(ps_out, gpus)
-
-        for gpu in gpus.values():
-            user_memory = {}
-            for proc in gpu["processes"]:
-                user = proc["user"]
-                if user not in user_memory:
-                    user_memory[user] = 0
-                user_memory[user] += proc["memory"]
-
-            total_proc_mem = sum(user_memory.values())
-            if total_proc_mem > 0 and gpu["memory_used"] > 0:
-                ratio = gpu["memory_used"] / total_proc_mem
-                if ratio > 1.5:
-                    if len(user_memory) == 1:
-                        user_memory[list(user_memory.keys())[0]] = gpu["memory_used"]
-                    else:
-                        for user in user_memory:
-                            proportion = user_memory[user] / total_proc_mem
-                            user_memory[user] = int(gpu["memory_used"] * proportion)
-
-            gpu["processes"] = [
-                {"user": u, "memory": m} for u, m in user_memory.items()
-            ]
-
-        return {
-            "server": server["name"],
-            "gpus": sorted(gpus.values(), key=lambda x: x["index"]),
-            "error": None,
-        }
+        return build_gpu_result(
+            server,
+            status,
+            extract_marked_section(out, GPU_INFO_GPU_START, GPU_INFO_GPU_END),
+            extract_marked_section(out, GPU_INFO_APPS_START, GPU_INFO_APPS_END),
+            extract_marked_section(out, GPU_INFO_PS_START, GPU_INFO_PS_END),
+            err,
+        )
     except Exception as e:
         error_message = str(e) or e.__class__.__name__
-        logger.error(f"Error getting GPU info for {server['name']}: {error_message}")
+        logger.error("Error getting GPU info for %s: %s", server["name"], error_message)
         return {"error": sanitize_error(error_message), "server": server["name"]}
 
 
@@ -2715,6 +2935,436 @@ def publish_gpu_result(result, server_names):
         last_update = now
 
 
+def compute_collector_backoff(attempt, base, maximum, jitter):
+    delay = min(maximum, base * (2 ** max(0, attempt)))
+    if jitter > 0:
+        delay += random.uniform(0, jitter)
+    return min(maximum, delay)
+
+
+def get_gpu_collector_signature(server, monitoring_settings):
+    return (
+        get_gpu_cache_identity(server),
+        get_ssh_connection_identity(server),
+        json.dumps(get_ssh_settings(server), sort_keys=True),
+        monitoring_settings["collector_mode"],
+        monitoring_settings["refresh_interval"],
+        monitoring_settings["gpu_command_total_timeout"],
+        monitoring_settings["gpu_operation_timeout"],
+        monitoring_settings["collector_retry_backoff_max"],
+    )
+
+
+class GPUCollector:
+    SSH_NAMESPACE_PREFIX = "gpu-collector"
+
+    def __init__(self, server, monitoring_settings, publish_callback):
+        self.server = copy.deepcopy(server)
+        self.monitoring_settings = dict(monitoring_settings)
+        self.publish_callback = publish_callback
+        self.ssh_namespace = (
+            f"{self.SSH_NAMESPACE_PREFIX}:{self.server['name']}:"
+            f"{secrets.token_hex(8)}"
+        )
+        self.signature = get_gpu_collector_signature(
+            self.server,
+            self.monitoring_settings,
+        )
+        self.stop_event = threading.Event()
+        self.state_lock = threading.Lock()
+        self.send_lock = threading.Lock()
+        self.thread = None
+        self.client = None
+        self.channel = None
+        self.backoff_attempt = 0
+        self.stderr_tail = bytearray()
+
+    def start(self):
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"gpu-collector-{self.server['name']}",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def is_alive(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def stop(self, timeout=2):
+        self.stop_event.set()
+        cleanup_deadline = make_ssh_deadline(max(0, min(1, timeout)))
+        with self.state_lock:
+            client = self.client
+            channel = self.channel
+        if channel is not None:
+            close_ssh_channel(
+                channel,
+                timeout=min(1, timeout),
+                cleanup_deadline=cleanup_deadline,
+            )
+        if client is not None:
+            invalidate_ssh_client(
+                self.server,
+                expected_client=client,
+                cleanup_deadline=cleanup_deadline,
+                namespace=self.ssh_namespace,
+            )
+        if (
+            self.thread is not None
+            and self.thread is not threading.current_thread()
+        ):
+            self.thread.join(timeout=max(0, timeout))
+
+    def _publish_error(self, error):
+        message = str(error) or error.__class__.__name__
+        self.publish_callback(
+            self,
+            {
+                "server": self.server["name"],
+                "error": sanitize_error(message),
+            },
+        )
+
+    def _run(self):
+        if self.monitoring_settings["collector_mode"] in {"poll", "batch"}:
+            self._run_polling()
+            return
+
+        ssh_settings = get_ssh_settings(self.server)
+        retry_base = max(1.0, ssh_settings["retry_backoff_base"])
+        retry_max = self.monitoring_settings["collector_retry_backoff_max"]
+        retry_jitter = ssh_settings["retry_jitter"]
+
+        while not self.stop_event.is_set():
+            try:
+                self._run_stream_session()
+                if not self.stop_event.is_set():
+                    raise paramiko.SSHException("GPU collector stream ended")
+            except Exception as e:
+                if self.stop_event.is_set():
+                    break
+                self._publish_error(e)
+                delay = compute_collector_backoff(
+                    self.backoff_attempt,
+                    retry_base,
+                    retry_max,
+                    retry_jitter,
+                )
+                self.backoff_attempt += 1
+                logger.warning(
+                    "GPU collector for %s failed: %s: %s; reconnecting in %.2fs",
+                    self.server["name"],
+                    e.__class__.__name__,
+                    str(e) or repr(e),
+                    delay,
+                )
+                self.stop_event.wait(delay)
+
+    def _run_polling(self):
+        interval = self.monitoring_settings["refresh_interval"]
+        while not self.stop_event.is_set():
+            result = get_gpu_info_ssh(self.server)
+            if self.stop_event.is_set():
+                break
+            self.publish_callback(self, result)
+            self.stop_event.wait(interval)
+
+    def _set_session_state(self, client, channel):
+        with self.state_lock:
+            self.client = client
+            self.channel = channel
+
+    def _clear_session_state(self, client, channel):
+        with self.state_lock:
+            if self.client is client:
+                self.client = None
+            if self.channel is channel:
+                self.channel = None
+
+    def _append_stderr(self, data):
+        if not data:
+            return
+        self.stderr_tail.extend(data)
+        if len(self.stderr_tail) > GPU_COLLECTOR_STDERR_TAIL_BYTES:
+            del self.stderr_tail[:-GPU_COLLECTOR_STDERR_TAIL_BYTES]
+
+    def _read_frame(self, channel, parser, expected_seq, deadline=None):
+        if deadline is None:
+            deadline = make_ssh_deadline(
+                self.monitoring_settings["gpu_command_total_timeout"]
+            )
+        while not self.stop_event.is_set():
+            for _ in range(16):
+                if not channel.recv_ready():
+                    break
+                data = channel.recv(65536)
+                if not data:
+                    raise EOFError("GPU collector channel closed")
+                for frame in parser.feed(data):
+                    if frame["seq"] < expected_seq:
+                        continue
+                    if frame["seq"] != expected_seq:
+                        raise ValueError("Unexpected GPU collector frame sequence")
+                    return frame
+
+            for _ in range(16):
+                if not channel.recv_stderr_ready():
+                    break
+                self._append_stderr(channel.recv_stderr(65536))
+
+            if channel.closed or channel.exit_status_ready():
+                error = self.stderr_tail.decode("utf-8", "replace").strip()
+                raise paramiko.SSHException(
+                    error or "GPU collector channel exited"
+                )
+            get_ssh_deadline_remaining(deadline, "GPU collector sample")
+            self.stop_event.wait(0.05)
+
+        raise InterruptedError("GPU collector stopped")
+
+    def _run_stream_session(self):
+        operation_deadline = make_ssh_deadline(
+            self.monitoring_settings["gpu_operation_timeout"]
+        )
+        cleanup_deadline = make_ssh_cleanup_deadline(operation_deadline)
+        ssh_settings = get_ssh_settings(self.server)
+        client = None
+        channel = None
+        transport = None
+        self.stderr_tail.clear()
+        nonce = secrets.token_hex(16)
+        parser = GPUStreamFrameParser(nonce)
+        sample_timeout = max(
+            1,
+            min(
+                60,
+                self.monitoring_settings["gpu_command_total_timeout"] / 2,
+            ),
+        )
+
+        try:
+            client, was_reused = get_ssh_client(
+                self.server,
+                deadline=operation_deadline,
+                namespace=self.ssh_namespace,
+            )
+            self._set_session_state(client, None)
+            if self.stop_event.is_set():
+                raise InterruptedError("GPU collector stopped during connect")
+            transport = ensure_ssh_client_active(client)
+            open_timeout = ssh_settings["channel_open_timeout"]
+            if was_reused:
+                open_timeout = min(
+                    open_timeout,
+                    ssh_settings["reused_channel_open_timeout"],
+                )
+            channel = open_ssh_session(
+                transport,
+                open_timeout,
+                deadline=operation_deadline,
+                cleanup_deadline=cleanup_deadline,
+            )
+            self._set_session_state(client, channel)
+            if self.stop_event.is_set():
+                raise InterruptedError("GPU collector stopped during channel open")
+            channel.settimeout(
+                cap_ssh_timeout(
+                    ssh_settings["command_idle_timeout"],
+                    operation_deadline,
+                    "GPU collector channel",
+                )
+            )
+            execute_ssh_channel_command(
+                channel,
+                build_gpu_collector_command(nonce, sample_timeout),
+                ssh_settings["command_idle_timeout"],
+                transport=transport,
+                deadline=operation_deadline,
+                cleanup_deadline=cleanup_deadline,
+            )
+            if self.stop_event.is_set():
+                raise InterruptedError("GPU collector stopped during stream start")
+            logger.info("GPU collector stream started for %s", self.server["name"])
+
+            seq = 0
+            interval = self.monitoring_settings["refresh_interval"]
+            next_poll_at = time.monotonic()
+            while not self.stop_event.is_set():
+                wait_time = max(0.0, next_poll_at - time.monotonic())
+                if self.stop_event.wait(wait_time):
+                    break
+                seq += 1
+                poll_started = time.monotonic()
+                sample_deadline = make_ssh_deadline(
+                    self.monitoring_settings["gpu_command_total_timeout"]
+                )
+                channel.settimeout(
+                    cap_ssh_timeout(
+                        min(
+                            ssh_settings["command_idle_timeout"],
+                            self.monitoring_settings["gpu_command_total_timeout"],
+                        ),
+                        sample_deadline,
+                        "GPU collector sample send",
+                    )
+                )
+                with self.send_lock:
+                    channel.sendall(f"POLL|{seq}\n".encode("ascii"))
+                frame = self._read_frame(
+                    channel,
+                    parser,
+                    seq,
+                    sample_deadline,
+                )
+                self.backoff_attempt = 0
+                result = build_gpu_result(
+                    self.server,
+                    frame["status"],
+                    frame["gpu"].decode("utf-8", "replace"),
+                    frame["apps"].decode("utf-8", "replace"),
+                    frame["ps"].decode("utf-8", "replace"),
+                    frame["error"].decode("utf-8", "replace"),
+                )
+                self.publish_callback(self, result)
+                next_poll_at = max(
+                    poll_started + interval,
+                    time.monotonic(),
+                )
+        finally:
+            self._clear_session_state(client, channel)
+            cleanup_deadline = make_ssh_deadline(SSH_CLEANUP_GRACE_SECONDS)
+            if channel is not None:
+                close_ssh_channel(
+                    channel,
+                    transport,
+                    cleanup_deadline=cleanup_deadline,
+                )
+            if client is not None:
+                invalidate_ssh_client(
+                    self.server,
+                    expected_client=client,
+                    cleanup_deadline=cleanup_deadline,
+                    namespace=self.ssh_namespace,
+                )
+
+
+class GPUCollectorManager:
+    def __init__(self, collector_factory=GPUCollector):
+        self.collector_factory = collector_factory
+        self.collectors = {}
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+
+    def publish_from(self, collector, result):
+        server_name = collector.server["name"]
+        with self.lock:
+            if self.collectors.get(server_name) is not collector:
+                return False
+            publish_gpu_result(result, list(self.collectors))
+            return True
+
+    def reconcile_once(self, servers=None, monitoring_settings=None):
+        if servers is None:
+            servers = get_configured_servers()
+        if monitoring_settings is None:
+            monitoring_settings = get_monitoring_settings()
+        desired = {server["name"]: server for server in servers}
+        to_stop = []
+        to_start = []
+
+        with self.lock:
+            current = self.collectors
+            planned = {}
+            for name, server in desired.items():
+                signature = get_gpu_collector_signature(
+                    server,
+                    monitoring_settings,
+                )
+                collector = current.get(name)
+                collector_running = (
+                    collector is not None
+                    and (
+                        not hasattr(collector, "is_alive")
+                        or collector.is_alive()
+                    )
+                )
+                if collector_running and collector.signature == signature:
+                    planned[name] = collector
+                    continue
+                collector = self.collector_factory(
+                    server,
+                    monitoring_settings,
+                    self.publish_from,
+                )
+                planned[name] = collector
+                to_start.append(collector)
+
+            to_stop = [
+                collector
+                for name, collector in current.items()
+                if planned.get(name) is not collector
+            ]
+            self.collectors = planned
+            initialize_gpu_cache(servers)
+
+        for collector in to_stop:
+            collector.stop()
+        start_errors = []
+        for collector in to_start:
+            with self.lock:
+                should_start = (
+                    not self.stop_event.is_set()
+                    and self.collectors.get(collector.server["name"])
+                    is collector
+                )
+            if should_start:
+                try:
+                    collector.start()
+                except Exception as e:
+                    with self.lock:
+                        if (
+                            self.collectors.get(collector.server["name"])
+                            is collector
+                        ):
+                            self.collectors.pop(collector.server["name"], None)
+                    collector.stop(timeout=0)
+                    start_errors.append(e)
+            else:
+                collector.stop(timeout=0)
+        if start_errors:
+            raise start_errors[0]
+
+    def run(self):
+        logger.info("Starting independent GPU collector manager")
+        try:
+            while not self.stop_event.is_set() and not shutdown_event.is_set():
+                try:
+                    monitoring_settings = get_monitoring_settings()
+                    self.reconcile_once(
+                        monitoring_settings=monitoring_settings,
+                    )
+                    delay = monitoring_settings["collector_reconcile_interval"]
+                except Exception as e:
+                    logger.error("GPU collector reconciliation failed: %s", e)
+                    delay = GPU_COLLECTOR_RECONCILE_SECONDS
+                self.stop_event.wait(delay)
+        finally:
+            self.stop()
+
+    def stop(self, timeout=5):
+        self.stop_event.set()
+        with self.lock:
+            collectors = list(self.collectors.values())
+            self.collectors.clear()
+        if not collectors:
+            return
+        per_collector_timeout = max(0.1, timeout / len(collectors))
+        for collector in collectors:
+            collector.stop(timeout=per_collector_timeout)
+
+
 def refresh_data():
     servers = get_configured_servers()
     server_names = [server["name"] for server in servers]
@@ -2742,13 +3392,20 @@ def refresh_data():
 
 
 def background_worker():
-    logger.info("Starting background worker")
-    while True:
-        try:
-            refresh_data()
-        except Exception as e:
-            logger.error(f"Error in background worker: {e}")
-        time.sleep(get_refresh_interval())
+    global gpu_collector_manager
+    monitoring_settings = get_monitoring_settings()
+    if monitoring_settings["collector_mode"] == "batch":
+        logger.info("Starting legacy batch GPU worker")
+        while not shutdown_event.is_set():
+            try:
+                refresh_data()
+            except Exception as e:
+                logger.error(f"Error in background worker: {e}")
+            shutdown_event.wait(get_refresh_interval())
+        return
+
+    gpu_collector_manager = GPUCollectorManager()
+    gpu_collector_manager.run()
 
 
 @app.route("/")
@@ -2771,6 +3428,8 @@ def get_servers():
             "servers": servers,
             "refresh_interval": monitoring_settings["refresh_interval"],
             "poll_interval": monitoring_settings["api_poll_interval"],
+            "collector_mode": monitoring_settings["collector_mode"],
+            "gpu_workers": GPU_MAX_WORKERS,
         }
     )
 
