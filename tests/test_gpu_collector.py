@@ -1,6 +1,11 @@
 import copy
+import os
+import shlex
+import subprocess
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import app
@@ -143,6 +148,333 @@ class GPUStreamFrameParserTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "GPU collector frame is too large"):
             parser.feed(header)
+
+
+class GPUCollectorCommandTests(unittest.TestCase):
+    def run_combined_query_awk(self, topology, query_output):
+        completed = subprocess.run(
+            [
+                "awk",
+                "-v",
+                f"marker={app.GPU_COMBINED_QUERY_MARKER}",
+                app.GPU_COMBINED_QUERY_AWK,
+            ],
+            input=(
+                topology.rstrip("\n")
+                + "\n"
+                + app.GPU_COMBINED_QUERY_MARKER
+                + "\n"
+                + query_output
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return completed
+
+    def test_stream_command_caches_topology_and_has_one_combined_query_per_poll(self):
+        command = app.build_gpu_collector_command(NONCE, 30)
+        command_parts = shlex.split(command)
+
+        self.assertEqual(command_parts[:2], ["sh", "-c"])
+        script = command_parts[2]
+        startup_script, poll_loop = script.split("while IFS= read -r request", 1)
+
+        self.assertIn("--query-gpu=", startup_script)
+        for field in ("index", "gpu_bus_id", "name"):
+            self.assertIn(field, startup_script)
+        self.assertNotIn("utilization.gpu", startup_script)
+        self.assertNotIn("memory.used", startup_script)
+        self.assertNotIn("--query-gpu=", poll_loop)
+        self.assertNotIn("--query-compute-apps=", poll_loop)
+        self.assertIn("MEMORY,UTILIZATION,PIDS", poll_loop)
+
+    def test_compact_combined_query_output_remains_gum1_compatible(self):
+        raw_query_output = """\
+==============NVSMI LOG==============
+
+GPU 00000000:01:00.0
+    FB Memory Usage
+        Total                             : 24576 MiB
+        Reserved                          : 0 MiB
+        Used                              : 1024 MiB
+        Free                              : 23552 MiB
+    Utilization
+        Gpu                               : 25 %
+        Memory                            : 4 %
+        Encoder                           : 0 %
+        Decoder                           : 0 %
+    Processes
+        GPU instance ID                  : N/A
+        Compute instance ID              : N/A
+        Process ID                       : 4242
+        Type                             : C
+        Name                             : python
+        Used GPU Memory                  : 1024 MiB
+"""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            invocation_log = temp_path / "nvidia-smi.log"
+            fake_nvidia_smi = temp_path / "nvidia-smi"
+            fake_ps = temp_path / "ps"
+            fake_date = temp_path / "date"
+
+            fake_nvidia_smi.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$NVIDIA_SMI_LOG\"\n"
+                "case \"$*\" in\n"
+                "  *--query-gpu=*)\n"
+                "    printf '%s\\n' '0, 00000000:01:00.0, Test GPU'\n"
+                "    ;;\n"
+                "  *'-q'*'-d MEMORY,UTILIZATION,PIDS'*)\n"
+                "    printf '%s' \"$NVIDIA_SMI_QUERY_OUTPUT\"\n"
+                "    ;;\n"
+                "  *)\n"
+                "    printf '%s\\n' \"unexpected nvidia-smi arguments: $*\" >&2\n"
+                "    exit 64\n"
+                "    ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_ps.write_text(
+                "#!/bin/sh\nprintf '%s\\n' ' 4242 alice'\n",
+                encoding="utf-8",
+            )
+            fake_date.write_text(
+                "#!/bin/sh\nprintf '%s\\n' '1700000000'\n",
+                encoding="utf-8",
+            )
+            for executable in (fake_nvidia_smi, fake_ps, fake_date):
+                executable.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{temp_dir}:{env.get('PATH', '')}",
+                    "NVIDIA_SMI_LOG": str(invocation_log),
+                    "NVIDIA_SMI_QUERY_OUTPUT": raw_query_output,
+                }
+            )
+            completed = subprocess.run(
+                app.build_gpu_collector_command(NONCE, 30),
+                shell=True,
+                input="POLL|1\nPOLL|2\nQUIT\n",
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=5,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            invocations = invocation_log.read_text(encoding="utf-8").splitlines()
+
+        topology_calls = [
+            invocation for invocation in invocations if "--query-gpu=" in invocation
+        ]
+        combined_calls = [
+            invocation
+            for invocation in invocations
+            if "-q" in invocation and "MEMORY,UTILIZATION,PIDS" in invocation
+        ]
+        self.assertEqual(len(topology_calls), 1, invocations)
+        self.assertEqual(len(combined_calls), 2, invocations)
+        self.assertFalse(
+            any("--query-compute-apps=" in invocation for invocation in invocations),
+            invocations,
+        )
+
+        frames = app.GPUStreamFrameParser(NONCE).feed(completed.stdout.encode())
+        self.assertEqual([frame["seq"] for frame in frames], [1, 2])
+        for frame in frames:
+            compact_size = sum(
+                len(frame[key]) for key in ("gpu", "apps", "ps", "error")
+            )
+            self.assertLess(compact_size, len(raw_query_output.encode()))
+            self.assertNotIn(b"FB Memory Usage", frame["gpu"])
+            result = app.build_gpu_result(
+                make_server("alpha"),
+                frame["status"],
+                frame["gpu"].decode(),
+                frame["apps"].decode(),
+                frame["ps"].decode(),
+                frame["error"].decode(),
+            )
+            self.assertIsNone(result["error"])
+            self.assertEqual(
+                result["gpus"],
+                [
+                    {
+                        "index": 0,
+                        "name": "Test GPU",
+                        "gpu_util": 25,
+                        "memory_used": 1024,
+                        "memory_total": 24576,
+                        "processes": [{"user": "alice", "memory": 1024}],
+                    }
+                ],
+            )
+
+    def test_combined_parser_ignores_other_memory_sections_and_empty_processes(self):
+        completed = self.run_combined_query_awk(
+            "0, 00000000:01:00.0, Test GPU\n",
+            """\
+GPU 00000000:01:00.0
+    FB Memory Usage
+        Total                             : 24576 MiB
+        Used                              : 1 MiB
+    BAR1 Memory Usage
+        Total                             : 256 MiB
+        Used                              : 7 MiB
+    Conf Compute Protected Memory Usage
+        Total                             : 0 MiB
+        Used                              : 0 MiB
+    Utilization
+        GPU                               : N/A
+    GPU Utilization Samples
+        Max                               : 99 %
+    Processes                             : None
+""",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout,
+            "G|0, 00000000:01:00.0, Test GPU, 0, 1, 24576\n",
+        )
+
+    def test_combined_parser_keeps_compute_types_and_skips_graphics_only(self):
+        completed = self.run_combined_query_awk(
+            "0, 00000000:01:00.0, Test GPU\n",
+            """\
+GPU 00000000:01:00.0
+    FB Memory Usage
+        Total                             : 24576 MiB
+        Used                              : 1536 MiB
+    Utilization
+        Gpu                               : 40 %
+    Processes
+        Process ID                        : 100
+            Type                          : G
+            Used GPU Memory               : 512 MiB
+        Process ID                        : 200
+            Type                          : C+G
+            Used GPU Memory               : 1024 MiB
+""",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout.splitlines(),
+            [
+                "G|0, 00000000:01:00.0, Test GPU, 40, 1536, 24576",
+                "A|00000000:01:00.0, 200, 1024",
+            ],
+        )
+
+    def test_combined_parser_rejects_incomplete_or_unknown_gpu_records(self):
+        for query_output, expected_error in (
+            (
+                """\
+GPU 00000000:01:00.0
+    FB Memory Usage
+        Total                             : 24576 MiB
+        Used                              : 1 MiB
+    Processes                             : None
+""",
+                "incomplete GPU record",
+            ),
+            (
+                """\
+GPU 00000000:02:00.0
+    FB Memory Usage
+        Total                             : 24576 MiB
+        Used                              : 1 MiB
+    Utilization
+        Gpu                               : 0 %
+    Processes                             : None
+""",
+                "unknown GPU bus id",
+            ),
+        ):
+            with self.subTest(expected_error=expected_error):
+                completed = self.run_combined_query_awk(
+                    "0, 00000000:01:00.0, Test GPU\n",
+                    query_output,
+                )
+
+                self.assertEqual(completed.returncode, 65)
+                self.assertIn(f"E|{expected_error}", completed.stdout)
+
+    def test_stream_exits_after_parse_error_so_topology_is_refreshed(self):
+        incomplete_query_output = """\
+GPU 00000000:01:00.0
+    FB Memory Usage
+        Total                             : 24576 MiB
+        Used                              : 1 MiB
+    Processes                             : None
+"""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            invocation_log = temp_path / "nvidia-smi.log"
+            fake_nvidia_smi = temp_path / "nvidia-smi"
+            fake_date = temp_path / "date"
+
+            fake_nvidia_smi.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$NVIDIA_SMI_LOG\"\n"
+                "case \"$*\" in\n"
+                "  *--query-gpu=*)\n"
+                "    printf '%s\\n' '0, 00000000:01:00.0, Test GPU'\n"
+                "    ;;\n"
+                "  *'-q'*'-d MEMORY,UTILIZATION,PIDS'*)\n"
+                "    printf '%s' \"$NVIDIA_SMI_QUERY_OUTPUT\"\n"
+                "    ;;\n"
+                "  *) exit 64;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_date.write_text(
+                "#!/bin/sh\nprintf '%s\\n' '1700000000'\n",
+                encoding="utf-8",
+            )
+            for executable in (fake_nvidia_smi, fake_date):
+                executable.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{temp_dir}:{env.get('PATH', '')}",
+                    "NVIDIA_SMI_LOG": str(invocation_log),
+                    "NVIDIA_SMI_QUERY_OUTPUT": incomplete_query_output,
+                }
+            )
+            completed = subprocess.run(
+                app.build_gpu_collector_command(NONCE, 30),
+                shell=True,
+                input="POLL|1\nPOLL|2\n",
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=5,
+                check=False,
+            )
+            invocations = invocation_log.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(completed.returncode, 65, completed.stderr)
+        combined_calls = [
+            invocation
+            for invocation in invocations
+            if "-q" in invocation and "MEMORY,UTILIZATION,PIDS" in invocation
+        ]
+        self.assertEqual(len(combined_calls), 1, invocations)
+        frames = app.GPUStreamFrameParser(NONCE).feed(completed.stdout.encode())
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["seq"], 1)
+        self.assertNotEqual(frames[0]["status"], 0)
+        self.assertIn(b"incomplete GPU record", frames[0]["error"])
 
 
 class GPUCollectorBackoffTests(unittest.TestCase):

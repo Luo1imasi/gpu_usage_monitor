@@ -58,7 +58,7 @@ cp config.example.json config.json
 }
 ```
 
-默认 `collector_mode=stream`：每台服务器拥有独立采集线程、专用 SSH Transport 和一个长生命周期 Channel。本地按 `refresh_interval_seconds` 为该服务器安排下一次采样；若上一次尚未完成则不并发、不补发，完成后立即进入下一次。慢服务器不会阻塞其他服务器。远端只运行随 SSH Channel 存活的 shell，不安装服务、不写文件，断线后由 sshd 回收。`poll` 模式保留独立调度但每次重新执行命令，`batch` 模式保留旧的整批查询逻辑（切换 `batch` 后需重启进程）。
+默认 `collector_mode=stream`：每台服务器拥有独立采集线程、专用 SSH Transport 和一个长生命周期 Channel。本地按 `refresh_interval_seconds` 为该服务器安排下一次采样；若上一次尚未完成则不并发、不补发，完成后立即进入下一次。慢服务器不会阻塞其他服务器。远端只运行随 SSH Channel 存活的 shell，不安装服务、不写文件，断线后由 sshd 回收。stream 启动时会查询并缓存一次 GPU 拓扑；之后每轮只调用一次 `nvidia-smi -q -d MEMORY,UTILIZATION,PIDS`，并在远端将约 21 KB 的人类可读输出压缩回现有 GPU/APPS/PS CSV，通常只传输约 0.6–1 KB。输出缺字段或 GPU 拓扑变化时整轮失败并通过重连刷新拓扑，不会发布部分数据。`poll` 模式保留独立调度但每次重新执行命令，`batch` 模式保留旧的整批查询逻辑（切换 `batch` 后需重启进程）。
 
 `gpu_command_total_timeout_seconds` 是单次远端采样的子预算，`gpu_operation_timeout_seconds` 是包含排队、建连和 Channel 启动在内的单服务器预算；超时后的异步资源清理最多允许 1 秒共享宽限期。采集器断线按指数退避，最大值由 `collector_retry_backoff_max_seconds` 控制。前端通过 `api_poll_interval_seconds` 读取逐服务器更新的内存缓存，页面显示的是最新样本时间而不是轮询时间。
 
