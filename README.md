@@ -1,94 +1,94 @@
 # GPU Monitor
 
-Web 界面监控多台服务器的 NVIDIA GPU 使用情况。
+基于 Flask 和 SSH 的多服务器 NVIDIA GPU 监控与用户访问管理工具。
+
+## 功能
+
+- 展示 GPU 利用率、显存占用、进程和用户
+- 按服务器独立采集，慢服务器互不阻塞
+- 复用 SSH 连接，支持保活、限流、超时和重试
+- 管理远端用户、SSH 公钥和 sudo 权限
+- 检查用户在各服务器上的访问状态
+- 展示 `/home` 文件系统和各用户目录占用
+- 对管理接口使用管理员 Token 鉴权
 
 ## 安装
 
 ```bash
 pip install -r requirements.txt
-```
-
-## 配置
-
-复制示例配置并编辑本地 `config.json`，设置管理 Token 和服务器信息：
-
-```bash
 cp config.example.json config.json
 ```
 
-`config.json` 是实际运行时读取的本地配置，包含管理 Token、服务器地址、用户名、密钥路径等敏感信息，已被 `.gitignore` 忽略；提交代码时请只提交 `config.example.json`。
+被监控服务器需要支持 SSH 并安装 NVIDIA 驱动。用户管理功能还需要远端 Python 3 和免交互 `sudo`。
 
-```json
-{
-  "admin_token": "change-me",
-  "monitoring": {
-    "refresh_interval_seconds": 2,
-    "gpu_command_total_timeout_seconds": 90,
-    "gpu_operation_timeout_seconds": 150,
-    "api_poll_interval_seconds": 2,
-    "collector_mode": "stream",
-    "collector_reconcile_interval_seconds": 2,
-    "collector_retry_backoff_max_seconds": 60
-  },
-  "ssh": {
-    "connect_timeout_seconds": 30,
-    "banner_timeout_seconds": 45,
-    "auth_timeout_seconds": 45,
-    "connection_total_timeout_seconds": 120,
-    "channel_open_timeout_seconds": 60,
-    "reused_channel_open_timeout_seconds": 20,
-    "command_idle_timeout_seconds": 60,
-    "keepalive_interval_seconds": 15,
-    "retry_count": 1,
-    "retry_backoff_base_seconds": 2,
-    "retry_backoff_max_seconds": 4,
-    "retry_jitter_seconds": 2,
-    "connect_jitter_seconds": 1.5
-  },
-  "servers": [
-    {
-      "name": "Server 1",
-      "host": "192.168.1.100",
-      "port": 22,
-      "username": "your_username",
-      "key_file": "~/.ssh/id_rsa",
-      "accept_unknown_host": false
-    }
-  ]
-}
-```
+## 配置
 
-默认 `collector_mode=stream`：每台服务器拥有独立采集线程、专用 SSH Transport 和一个长生命周期 Channel。本地按 `refresh_interval_seconds` 为该服务器安排下一次采样；若上一次尚未完成则不并发、不补发，完成后立即进入下一次。慢服务器不会阻塞其他服务器。远端只运行随 SSH Channel 存活的 shell，不安装服务、不写文件，断线后由 sshd 回收。stream 启动时会查询并缓存一次 GPU 拓扑；之后每轮只调用一次 `nvidia-smi -q -d MEMORY,UTILIZATION,PIDS`，并在远端将约 21 KB 的人类可读输出压缩回现有 GPU/APPS/PS CSV，通常只传输约 0.6–1 KB。输出缺字段或 GPU 拓扑变化时整轮失败并通过重连刷新拓扑，不会发布部分数据。`poll` 模式保留独立调度但每次重新执行命令，`batch` 模式保留旧的整批查询逻辑（切换 `batch` 后需重启进程）。
+复制 `config.example.json` 为 `config.json`，通常只需要设置 `admin_token` 和 `servers`。示例文件仅保留常用项；未列出的采集、超时和重试参数继续使用程序内置默认值，旧配置中的高级参数仍然兼容。
 
-`refresh_interval_seconds` 和 `api_poll_interval_seconds` 当前默认均为 2 秒，允许的最小值均为 1 秒。`gpu_command_total_timeout_seconds` 是单次远端采样的子预算，`gpu_operation_timeout_seconds` 是包含排队、建连和 Channel 启动在内的单服务器预算；超时后的异步资源清理最多允许 1 秒共享宽限期。采集器断线按指数退避，最大值由 `collector_retry_backoff_max_seconds` 控制。前端通过 `api_poll_interval_seconds` 读取逐服务器更新的内存缓存，页面显示的是最新样本时间而不是轮询时间。
+常用可选项：
 
-SSH timeout 均以秒为单位：建连、banner、认证、Channel 打开和命令空闲等待分别配置。只读查询遇到瞬态传输错误时最多安全重连一次，并带随机退避；用户配置、撤权和删账号等写操作在命令可能已经发出后不会自动重放。单台服务器可通过自己的 `ssh` 对象覆盖全局 SSH 参数。
+- `monitoring.storage_refresh_interval_seconds`：存储采集周期，默认 300 秒。
+- `monitoring.storage_user_min_size_mb`：用户目录显示阈值，默认 100 MiB。
+- `monitoring.collector_mode`：GPU 采集模式，默认 `stream`。
+- `ssh`：全局 SSH 超时和重试覆盖；也可在单台服务器的 `ssh` 中覆盖。
+- `servers[].accept_unknown_host`：是否接受未知主机密钥，默认 `false`。
 
-**安全说明：**
-- `admin_token`: 执行用户授权配置时需要在前端弹窗输入的管理 Token，请在本地 `config.json` 中改成强随机字符串
-- `accept_unknown_host`: 是否自动接受未知主机密钥（默认 false）
-  - `false`: 使用系统 known_hosts 验证主机密钥（推荐，更安全）
-  - `true`: 自动接受新主机密钥（仅用于测试环境）
-- 生产环境请预先配置 SSH known_hosts 或手动连接一次服务器以添加主机密钥
-- API 端点不再暴露敏感配置信息（host、username、key_file）
+`config.json` 和 `user.txt` 包含本地运行数据，均不应提交到版本库。
+
+### 采集模式
+
+- `stream`：每台服务器使用独立线程和长生命周期 SSH Channel，按采样周期请求 GPU 数据。
+- `poll`：每台服务器独立调度，每轮执行一次采集命令。
+- `batch`：按批次并发查询全部服务器；切换到或退出该模式需要重启进程。
+
+远端采集通过临时 shell 执行，不安装服务或写入程序文件。只读查询可在瞬态传输错误后重连一次；远端写操作使用保守重试策略，避免重复执行结果不确定的命令。
+
+服务器卡片内的存储项展示 `/home` 所在文件系统的总量、已用和可用空间；用户占用来自 UID 不小于 1000、主目录位于 `/home` 下的账号目录，按 `du -skx` 的已分配空间统计。`monitoring.storage_user_min_size_mb` 控制纳入统计的最小占用，默认为 100 MiB；仅过滤严格低于阈值且已成功测量的用户，达到阈值的用户仍会显示。无法测量的用户会保留并标记为部分可用，完整统计需要免交互 `sudo`。
 
 ## 运行
 
 ```bash
-# 生产环境
-python app.py
-
-# 开发环境（启用调试）
-FLASK_DEBUG=true python app.py
+python3 app.py
 ```
 
-访问 http://localhost:5000 查看监控界面。
+开发模式：
 
-## 功能
+```bash
+FLASK_DEBUG=true python3 app.py
+```
 
-- 实时显示 GPU 利用率和显存使用情况
-- 显示占用 GPU 的进程及用户
-- 每服务器独立常驻采集（默认目标周期 2 秒）
-- 支持多服务器监控
-- 专用 SSH 常驻 Channel、连接复用、保活、限流和单服务器独立重连
-- 前端 XSS 防护
+访问 <http://localhost:5000>。
+
+## 安全
+
+- 为 `admin_token` 设置强随机值。
+- `accept_unknown_host=false` 时使用系统 `known_hosts` 验证服务器主机密钥。
+- 生产环境应预先写入可信主机密钥。
+- 服务器列表 API 响应仅包含服务器名称。
+
+## 核心模块
+
+```text
+app.py                         # 服务入口
+gpu_monitor/
+├── config.py                  # 配置加载与参数约束
+├── ssh.py                     # SSH 连接和命令执行
+├── storage.py                 # /home 存储采集与缓存
+├── user_store.py              # 用户与 SSH 公钥存储
+├── access/
+│   ├── remote_commands.py     # 远端用户管理命令
+│   └── service.py             # 授权与访问矩阵服务
+├── gpu/
+│   ├── commands.py            # GPU 采集命令
+│   ├── parsing.py             # 输出与帧协议解析
+│   ├── state.py               # GPU 状态缓存
+│   └── collector.py           # 采集器与调度
+├── web.py                     # Flask 应用与路由
+└── runtime.py                 # 后台任务与资源关闭
+```
+
+## 测试
+
+```bash
+python3 -m unittest discover -v
+```
