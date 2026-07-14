@@ -23,7 +23,6 @@ instance/
 # Local runtime configuration and private data.
 # Commit config.example.json instead of config.json.
 config.json
-config.py
 user.txt
 
 # Editor/OS files

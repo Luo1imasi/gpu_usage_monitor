@@ -8,7 +8,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import app
+from gpu_monitor.gpu import collector as gpu_collector
+from gpu_monitor.gpu import commands as gpu_commands
+from gpu_monitor.gpu import parsing as gpu_parsing
 
 
 NONCE = "0123456789abcdef0123456789abcdef"
@@ -96,7 +98,7 @@ class GPUStreamFrameParserTests(unittest.TestCase):
         second = make_frame(seq=8, status=9, error=b"nvidia-smi failed")
         wire = b"collector startup noise\n" + first + second
 
-        parser = app.GPUStreamFrameParser(NONCE)
+        parser = gpu_parsing.GPUStreamFrameParser(NONCE)
         parsed = []
         chunk_sizes = (1, 2, 3, 5, 8, 13, 21)
         offset = 0
@@ -116,7 +118,7 @@ class GPUStreamFrameParserTests(unittest.TestCase):
         )
 
     def test_multiple_complete_frames_are_returned_by_one_feed(self):
-        parser = app.GPUStreamFrameParser(NONCE)
+        parser = gpu_parsing.GPUStreamFrameParser(NONCE)
 
         parsed = parser.feed(
             make_frame(seq=1, gpu=b"first")
@@ -132,7 +134,7 @@ class GPUStreamFrameParserTests(unittest.TestCase):
         )
 
     def test_partial_footer_waits_and_invalid_footer_is_rejected(self):
-        parser = app.GPUStreamFrameParser(NONCE)
+        parser = gpu_parsing.GPUStreamFrameParser(NONCE)
         encoded = make_frame(seq=3, gpu=b"payload")
 
         self.assertEqual(parser.feed(encoded[:-1]), [])
@@ -140,10 +142,10 @@ class GPUStreamFrameParserTests(unittest.TestCase):
             parser.feed(b"X")
 
     def test_declared_payload_over_limit_is_rejected_before_buffering_payload(self):
-        parser = app.GPUStreamFrameParser(NONCE)
+        parser = gpu_parsing.GPUStreamFrameParser(NONCE)
         header = (
             f"\x1eGUM1|{NONCE}|DATA|1|1700000000|0|"
-            f"{app.GPU_COLLECTOR_FRAME_MAX_BYTES + 1}|0|0|0\n"
+            f"{gpu_parsing.GPU_COLLECTOR_FRAME_MAX_BYTES + 1}|0|0|0\n"
         ).encode("ascii")
 
         with self.assertRaisesRegex(ValueError, "GPU collector frame is too large"):
@@ -156,13 +158,13 @@ class GPUCollectorCommandTests(unittest.TestCase):
             [
                 "awk",
                 "-v",
-                f"marker={app.GPU_COMBINED_QUERY_MARKER}",
-                app.GPU_COMBINED_QUERY_AWK,
+                f"marker={gpu_commands.GPU_COMBINED_QUERY_MARKER}",
+                gpu_commands.GPU_COMBINED_QUERY_AWK,
             ],
             input=(
                 topology.rstrip("\n")
                 + "\n"
-                + app.GPU_COMBINED_QUERY_MARKER
+                + gpu_commands.GPU_COMBINED_QUERY_MARKER
                 + "\n"
                 + query_output
             ),
@@ -173,7 +175,7 @@ class GPUCollectorCommandTests(unittest.TestCase):
         return completed
 
     def test_stream_command_caches_topology_and_has_one_combined_query_per_poll(self):
-        command = app.build_gpu_collector_command(NONCE, 30)
+        command = gpu_commands.build_gpu_collector_command(NONCE, 30)
         command_parts = shlex.split(command)
 
         self.assertEqual(command_parts[:2], ["sh", "-c"])
@@ -189,7 +191,7 @@ class GPUCollectorCommandTests(unittest.TestCase):
         self.assertNotIn("--query-compute-apps=", poll_loop)
         self.assertIn("MEMORY,UTILIZATION,PIDS", poll_loop)
 
-    def test_compact_combined_query_output_remains_gum1_compatible(self):
+    def test_compact_combined_query_output_uses_gum1_frames(self):
         raw_query_output = """\
 ==============NVSMI LOG==============
 
@@ -257,9 +259,9 @@ GPU 00000000:01:00.0
                 }
             )
             completed = subprocess.run(
-                app.build_gpu_collector_command(NONCE, 30),
+                gpu_commands.build_gpu_collector_command(NONCE, 30),
                 shell=True,
-                input="POLL|1\nPOLL|2\nQUIT\n",
+                input="POLL|1\nPOLL|2\n",
                 text=True,
                 capture_output=True,
                 env=env,
@@ -285,7 +287,9 @@ GPU 00000000:01:00.0
             invocations,
         )
 
-        frames = app.GPUStreamFrameParser(NONCE).feed(completed.stdout.encode())
+        frames = gpu_parsing.GPUStreamFrameParser(NONCE).feed(
+            completed.stdout.encode()
+        )
         self.assertEqual([frame["seq"] for frame in frames], [1, 2])
         for frame in frames:
             compact_size = sum(
@@ -293,7 +297,7 @@ GPU 00000000:01:00.0
             )
             self.assertLess(compact_size, len(raw_query_output.encode()))
             self.assertNotIn(b"FB Memory Usage", frame["gpu"])
-            result = app.build_gpu_result(
+            result = gpu_parsing.build_gpu_result(
                 make_server("alpha"),
                 frame["status"],
                 frame["gpu"].decode(),
@@ -452,7 +456,7 @@ GPU 00000000:01:00.0
                 }
             )
             completed = subprocess.run(
-                app.build_gpu_collector_command(NONCE, 30),
+                gpu_commands.build_gpu_collector_command(NONCE, 30),
                 shell=True,
                 input="POLL|1\nPOLL|2\n",
                 text=True,
@@ -470,7 +474,9 @@ GPU 00000000:01:00.0
             if "-q" in invocation and "MEMORY,UTILIZATION,PIDS" in invocation
         ]
         self.assertEqual(len(combined_calls), 1, invocations)
-        frames = app.GPUStreamFrameParser(NONCE).feed(completed.stdout.encode())
+        frames = gpu_parsing.GPUStreamFrameParser(NONCE).feed(
+            completed.stdout.encode()
+        )
         self.assertEqual(len(frames), 1)
         self.assertEqual(frames[0]["seq"], 1)
         self.assertNotEqual(frames[0]["status"], 0)
@@ -479,15 +485,25 @@ GPU 00000000:01:00.0
 
 class GPUCollectorBackoffTests(unittest.TestCase):
     def test_backoff_is_exponential_and_attempt_zero_starts_at_base(self):
-        self.assertEqual(app.compute_collector_backoff(0, 2, 60, 0), 2)
-        self.assertEqual(app.compute_collector_backoff(1, 2, 60, 0), 4)
-        self.assertEqual(app.compute_collector_backoff(4, 2, 60, 0), 32)
-        self.assertEqual(app.compute_collector_backoff(-3, 2, 60, 0), 2)
+        self.assertEqual(gpu_collector.compute_collector_backoff(0, 2, 60, 0), 2)
+        self.assertEqual(gpu_collector.compute_collector_backoff(1, 2, 60, 0), 4)
+        self.assertEqual(gpu_collector.compute_collector_backoff(4, 2, 60, 0), 32)
+        self.assertEqual(gpu_collector.compute_collector_backoff(-3, 2, 60, 0), 2)
 
     def test_backoff_jitter_is_applied_without_exceeding_configured_maximum(self):
-        with patch.object(app.random, "uniform", return_value=0.75) as uniform:
-            self.assertEqual(app.compute_collector_backoff(0, 2, 6, 1), 2.75)
-            self.assertEqual(app.compute_collector_backoff(3, 2, 6, 1), 6)
+        with patch.object(
+            gpu_collector.random,
+            "uniform",
+            return_value=0.75,
+        ) as uniform:
+            self.assertEqual(
+                gpu_collector.compute_collector_backoff(0, 2, 6, 1),
+                2.75,
+            )
+            self.assertEqual(
+                gpu_collector.compute_collector_backoff(3, 2, 6, 1),
+                6,
+            )
 
         self.assertEqual(uniform.call_count, 2)
         uniform.assert_any_call(0, 1)
@@ -500,7 +516,7 @@ class FakeCollector:
         self.server = copy.deepcopy(server)
         self.settings = dict(settings)
         self.publish_callback = publish_callback
-        self.signature = app.get_gpu_collector_signature(server, settings)
+        self.signature = gpu_collector.get_gpu_collector_signature(server, settings)
         self.started = False
         self.stopped = False
         self.stop_timeouts = []
@@ -555,12 +571,16 @@ class GPUCollectorManagerTests(unittest.TestCase):
         alpha = make_server("alpha")
         beta = make_server("beta")
         settings = monitoring_settings()
-        manager = app.GPUCollectorManager(collector_factory=FakeCollector)
+        manager = gpu_collector.GPUCollectorManager(collector_factory=FakeCollector)
 
         with (
-            patch.object(app, "get_gpu_collector_signature", side_effect=collector_signature),
-            patch.object(app, "initialize_gpu_cache"),
-            patch.object(app, "publish_gpu_result") as publish,
+            patch.object(
+                gpu_collector,
+                "get_gpu_collector_signature",
+                side_effect=collector_signature,
+            ),
+            patch.object(gpu_collector.gpu_state, "initialize_gpu_cache"),
+            patch.object(gpu_collector.gpu_state, "publish_gpu_result") as publish,
         ):
             manager.reconcile_once([alpha, beta], settings)
             old_alpha = manager.collectors["alpha"]
@@ -588,15 +608,15 @@ class GPUCollectorManagerTests(unittest.TestCase):
 
     def test_reconcile_replaces_collector_when_refresh_interval_changes(self):
         server = make_server("alpha")
-        manager = app.GPUCollectorManager(collector_factory=FakeCollector)
+        manager = gpu_collector.GPUCollectorManager(collector_factory=FakeCollector)
 
         with (
             patch.object(
-                app,
+                gpu_collector,
                 "get_gpu_collector_signature",
                 side_effect=collector_signature,
             ),
-            patch.object(app, "initialize_gpu_cache"),
+            patch.object(gpu_collector.gpu_state, "initialize_gpu_cache"),
         ):
             manager.reconcile_once(
                 [server],
@@ -617,7 +637,9 @@ class GPUCollectorManagerTests(unittest.TestCase):
     def test_each_server_gets_an_independent_thread_without_gpu_executor(self):
         servers = [make_server(f"gpu-{index}") for index in range(9)]
         settings = monitoring_settings()
-        manager = app.GPUCollectorManager(collector_factory=ThreadedFakeCollector)
+        manager = gpu_collector.GPUCollectorManager(
+            collector_factory=ThreadedFakeCollector
+        )
         forbidden_executor = MagicMock()
         forbidden_executor.submit.side_effect = AssertionError(
             "independent collectors must not use gpu_executor"
@@ -625,9 +647,13 @@ class GPUCollectorManagerTests(unittest.TestCase):
 
         try:
             with (
-                patch.object(app, "get_gpu_collector_signature", side_effect=collector_signature),
-                patch.object(app, "initialize_gpu_cache"),
-                patch.object(app, "gpu_executor", forbidden_executor),
+                patch.object(
+                    gpu_collector,
+                    "get_gpu_collector_signature",
+                    side_effect=collector_signature,
+                ),
+                patch.object(gpu_collector.gpu_state, "initialize_gpu_cache"),
+                patch.object(gpu_collector, "gpu_executor", forbidden_executor),
             ):
                 manager.reconcile_once(servers, settings)
 
@@ -656,15 +682,19 @@ class GPUCollectorManagerTests(unittest.TestCase):
                     {"server": self.server["name"], "gpus": [], "error": None},
                 )
 
-        manager = app.GPUCollectorManager(
+        manager = gpu_collector.GPUCollectorManager(
             collector_factory=PublishingOnStopCollector
         )
         settings = monitoring_settings()
 
         with (
-            patch.object(app, "get_gpu_collector_signature", side_effect=collector_signature),
-            patch.object(app, "initialize_gpu_cache"),
-            patch.object(app, "publish_gpu_result") as publish,
+            patch.object(
+                gpu_collector,
+                "get_gpu_collector_signature",
+                side_effect=collector_signature,
+            ),
+            patch.object(gpu_collector.gpu_state, "initialize_gpu_cache"),
+            patch.object(gpu_collector.gpu_state, "publish_gpu_result") as publish,
         ):
             manager.reconcile_once([make_server("alpha")], settings)
             collector = manager.collectors["alpha"]
@@ -679,12 +709,20 @@ class GPUCollectorManagerTests(unittest.TestCase):
         settings = monitoring_settings()
 
         with patch.object(
-            app,
+            gpu_collector,
             "get_gpu_collector_signature",
             side_effect=collector_signature,
         ):
-            first = app.GPUCollector(endpoint, settings, lambda *_args: True)
-            second = app.GPUCollector(alias, settings, lambda *_args: True)
+            first = gpu_collector.GPUCollector(
+                endpoint,
+                settings,
+                lambda *_args: True,
+            )
+            second = gpu_collector.GPUCollector(
+                alias,
+                settings,
+                lambda *_args: True,
+            )
 
         self.assertNotEqual(first.ssh_namespace, second.ssh_namespace)
         self.assertIn("alpha", first.ssh_namespace)
@@ -694,15 +732,15 @@ class GPUCollectorManagerTests(unittest.TestCase):
         alpha = make_server("alpha")
         beta = make_server("beta")
         settings = monitoring_settings()
-        manager = app.GPUCollectorManager(collector_factory=FakeCollector)
+        manager = gpu_collector.GPUCollectorManager(collector_factory=FakeCollector)
 
         with (
             patch.object(
-                app,
+                gpu_collector,
                 "get_gpu_collector_signature",
                 side_effect=collector_signature,
             ),
-            patch.object(app, "initialize_gpu_cache"),
+            patch.object(gpu_collector.gpu_state, "initialize_gpu_cache"),
         ):
             manager.reconcile_once([alpha], settings)
             current_alpha = manager.collectors["alpha"]
@@ -735,17 +773,17 @@ class GPUCollectorManagerTests(unittest.TestCase):
 
         server = make_server("alpha")
         settings = monitoring_settings()
-        manager = app.GPUCollectorManager(
+        manager = gpu_collector.GPUCollectorManager(
             collector_factory=HealthAwareCollector
         )
 
         with (
             patch.object(
-                app,
+                gpu_collector,
                 "get_gpu_collector_signature",
                 side_effect=collector_signature,
             ),
-            patch.object(app, "initialize_gpu_cache"),
+            patch.object(gpu_collector.gpu_state, "initialize_gpu_cache"),
         ):
             manager.reconcile_once([server], settings)
             dead = manager.collectors["alpha"]
@@ -784,11 +822,11 @@ class GPUCollectorStopTests(unittest.TestCase):
         }
 
         with patch.object(
-            app,
+            gpu_collector,
             "get_gpu_collector_signature",
             side_effect=collector_signature,
         ):
-            collector = app.GPUCollector(
+            collector = gpu_collector.GPUCollector(
                 make_server("alpha"),
                 monitoring_settings(refresh_interval=0),
                 lambda _collector, result: published.append(result),
@@ -810,14 +848,21 @@ class GPUCollectorStopTests(unittest.TestCase):
             raise InterruptedError("collector stopped while reading")
 
         with (
-            patch.object(app, "get_ssh_settings", return_value=ssh_settings),
-            patch.object(app, "get_ssh_client", return_value=(client, False)),
-            patch.object(app, "ensure_ssh_client_active", return_value=transport),
-            patch.object(app, "open_ssh_session", return_value=channel),
-            patch.object(app, "execute_ssh_channel_command"),
-            patch.object(app, "close_ssh_channel") as close_channel,
-            patch.object(app, "invalidate_ssh_client") as invalidate_client,
-            patch.object(app.secrets, "token_hex", return_value=NONCE),
+            patch.object(gpu_collector, "get_ssh_settings", return_value=ssh_settings),
+            patch.object(gpu_collector, "get_ssh_client", return_value=(client, False)),
+            patch.object(
+                gpu_collector,
+                "ensure_ssh_client_active",
+                return_value=transport,
+            ),
+            patch.object(gpu_collector, "open_ssh_session", return_value=channel),
+            patch.object(gpu_collector, "execute_ssh_channel_command"),
+            patch.object(gpu_collector, "close_ssh_channel") as close_channel,
+            patch.object(
+                gpu_collector,
+                "invalidate_ssh_client",
+            ) as invalidate_client,
+            patch.object(gpu_collector.secrets, "token_hex", return_value=NONCE),
             patch.object(collector, "_read_frame", side_effect=read_frame),
             patch.object(collector, "_publish_error") as publish_error,
         ):
@@ -833,7 +878,7 @@ class GPUCollectorStopTests(unittest.TestCase):
         publish_error.assert_not_called()
         self.assertGreater(
             close_channel.call_args.kwargs["cleanup_deadline"],
-            app.time.monotonic(),
+            gpu_collector.time.monotonic(),
         )
         self.assertEqual(
             close_channel.call_args.kwargs["cleanup_deadline"],
@@ -852,18 +897,22 @@ class GPUCollectorStopTests(unittest.TestCase):
             return {"server": server["name"], "gpus": [], "error": None}
 
         with patch.object(
-            app,
+            gpu_collector,
             "get_gpu_collector_signature",
             side_effect=collector_signature,
         ):
-            collector = app.GPUCollector(
+            collector = gpu_collector.GPUCollector(
                 make_server("alpha"),
                 monitoring_settings(collector_mode="poll"),
                 lambda _collector, result: published.append(result),
             )
 
         try:
-            with patch.object(app, "get_gpu_info_ssh", side_effect=blocking_query):
+            with patch.object(
+                gpu_collector,
+                "get_gpu_info_ssh",
+                side_effect=blocking_query,
+            ):
                 collector.start()
                 self.assertTrue(entered_query.wait(1))
                 collector.stop(timeout=0)

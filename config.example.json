@@ -2,27 +2,8 @@
   "admin_token": "change-me",
   "monitoring": {
     "refresh_interval_seconds": 2,
-    "gpu_command_total_timeout_seconds": 90,
-    "gpu_operation_timeout_seconds": 150,
     "api_poll_interval_seconds": 2,
-    "collector_mode": "stream",
-    "collector_reconcile_interval_seconds": 2,
-    "collector_retry_backoff_max_seconds": 60
-  },
-  "ssh": {
-    "connect_timeout_seconds": 30,
-    "banner_timeout_seconds": 45,
-    "auth_timeout_seconds": 45,
-    "connection_total_timeout_seconds": 120,
-    "channel_open_timeout_seconds": 60,
-    "reused_channel_open_timeout_seconds": 20,
-    "command_idle_timeout_seconds": 60,
-    "keepalive_interval_seconds": 15,
-    "retry_count": 1,
-    "retry_backoff_base_seconds": 2,
-    "retry_backoff_max_seconds": 4,
-    "retry_jitter_seconds": 2,
-    "connect_jitter_seconds": 1.5
+    "storage_user_min_size_mb": 100
   },
   "servers": [
     {
@@ -30,8 +11,7 @@
       "host": "192.168.1.100",
       "port": 22,
       "username": "your_username",
-      "key_file": "~/.ssh/id_rsa",
-      "accept_unknown_host": false
+      "key_file": "~/.ssh/id_rsa"
     }
   ]
 }

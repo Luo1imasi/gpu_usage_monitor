@@ -6,7 +6,8 @@ from unittest.mock import ANY, MagicMock, patch
 
 import paramiko
 
-import app
+import gpu_monitor.config as config_module
+import gpu_monitor.ssh as ssh
 
 
 SERVER = {
@@ -134,19 +135,19 @@ class DelayedStatusChannel(FakeChannel):
 
 class SSHConnectionTests(unittest.TestCase):
     def setUp(self):
-        with app.ssh_lock:
-            app.ssh_clients.clear()
-            app.ssh_connect_locks.clear()
-            app.ssh_command_locks.clear()
+        with ssh.ssh_lock:
+            ssh.ssh_clients.clear()
+            ssh.ssh_connect_locks.clear()
+            ssh.ssh_command_locks.clear()
 
     def tearDown(self):
-        with app.ssh_lock:
-            clients = list(app.ssh_clients.values())
-            app.ssh_clients.clear()
-            app.ssh_connect_locks.clear()
-            app.ssh_command_locks.clear()
+        with ssh.ssh_lock:
+            clients = list(ssh.ssh_clients.values())
+            ssh.ssh_clients.clear()
+            ssh.ssh_connect_locks.clear()
+            ssh.ssh_command_locks.clear()
         for client in clients:
-            app.close_ssh_client(client)
+            ssh.close_ssh_client(client)
 
     def test_get_ssh_settings_supports_global_and_server_override(self):
         config = {
@@ -157,8 +158,8 @@ class SSHConnectionTests(unittest.TestCase):
             }
         }
         server = {**SERVER, "ssh": {"connect_timeout_seconds": 40}}
-        with patch.object(app, "load_config", return_value=config):
-            settings = app.get_ssh_settings(server)
+        with patch.object(config_module, "load_config", return_value=config):
+            settings = config_module.get_ssh_settings(server)
 
         self.assertEqual(settings["connect_timeout"], 40.0)
         self.assertEqual(settings["banner_timeout"], 35.0)
@@ -166,14 +167,14 @@ class SSHConnectionTests(unittest.TestCase):
         self.assertEqual(settings["command_idle_timeout"], 60.0)
 
     def test_cached_authenticated_client_is_reused(self):
-        identity = app.get_ssh_connection_identity(SERVER)
+        identity = ssh.get_ssh_connection_identity(SERVER)
         client = make_client(identity)
-        key = app.get_ssh_cache_key(SERVER)
-        app.ssh_clients[key] = client
+        key = ssh.get_ssh_cache_key(SERVER)
+        ssh.ssh_clients[key] = client
 
-        with patch.object(app, "create_ssh_client") as create:
-            first_client, first_reused = app.get_ssh_client(SERVER)
-            second_client, second_reused = app.get_ssh_client(SERVER)
+        with patch.object(ssh, "create_ssh_client") as create:
+            first_client, first_reused = ssh.get_ssh_client(SERVER)
+            second_client, second_reused = ssh.get_ssh_client(SERVER)
 
         self.assertIs(first_client, client)
         self.assertIs(second_client, client)
@@ -183,35 +184,51 @@ class SSHConnectionTests(unittest.TestCase):
         create.assert_not_called()
 
     def test_invalidate_only_removes_expected_client(self):
-        key = app.get_ssh_cache_key(SERVER)
+        key = ssh.get_ssh_cache_key(SERVER)
         old_client = make_client()
         new_client = make_client()
-        app.ssh_clients[key] = new_client
+        ssh.ssh_clients[key] = new_client
 
-        self.assertFalse(app.invalidate_ssh_client(SERVER, old_client))
-        self.assertIs(app.ssh_clients[key], new_client)
+        self.assertFalse(ssh.invalidate_ssh_client(SERVER, old_client))
+        self.assertIs(ssh.ssh_clients[key], new_client)
         old_client.close.assert_called_once()
         new_client.close.assert_not_called()
 
-        self.assertTrue(app.invalidate_ssh_client(SERVER, new_client))
-        self.assertNotIn(key, app.ssh_clients)
+        self.assertTrue(ssh.invalidate_ssh_client(SERVER, new_client))
+        self.assertNotIn(key, ssh.ssh_clients)
         new_client.close.assert_called_once()
 
+    def test_shutdown_fences_new_connections_and_uses_bounded_close(self):
+        client = make_client()
+        ssh.ssh_clients[ssh.get_ssh_cache_key(SERVER)] = client
+
+        try:
+            with patch.object(ssh, "close_ssh_client", return_value=True) as close:
+                ssh.shutdown()
+
+            self.assertTrue(ssh.ssh_shutdown_event.is_set())
+            with self.assertRaisesRegex(RuntimeError, "shutting down"):
+                ssh.get_ssh_client(SERVER)
+            close.assert_called_once()
+            self.assertIsNotNone(close.call_args.kwargs["cleanup_deadline"])
+        finally:
+            ssh.ssh_shutdown_event.clear()
+
     def test_create_client_closes_temporary_client_on_connect_failure(self):
-        key = app.get_ssh_cache_key(SERVER)
+        key = ssh.get_ssh_cache_key(SERVER)
         identity = ("/tmp/test-key", None, True)
         client = MagicMock()
         client.connect.side_effect = TimeoutError("connect timeout")
 
         with (
-            patch.object(app.paramiko, "SSHClient", return_value=client),
-            patch.object(app, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(ssh.paramiko, "SSHClient", return_value=client),
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
         ):
             with self.assertRaises(TimeoutError):
-                app.create_ssh_client(SERVER, key, identity)
+                ssh.create_ssh_client(SERVER, key, identity)
 
         client.close.assert_called_once()
-        self.assertNotIn(key, app.ssh_clients)
+        self.assertNotIn(key, ssh.ssh_clients)
 
     def test_connect_has_an_overall_hard_timeout(self):
         release = threading.Event()
@@ -221,7 +238,7 @@ class SSHConnectionTests(unittest.TestCase):
 
         started = time.monotonic()
         with self.assertRaisesRegex(TimeoutError, "connection total timeout"):
-            app.connect_ssh_client(
+            ssh.connect_ssh_client(
                 client,
                 {},
                 deadline=time.monotonic() + 0.01,
@@ -232,9 +249,9 @@ class SSHConnectionTests(unittest.TestCase):
         client.close.assert_called()
 
     def test_cleanup_wait_is_capped_by_shared_grace_deadline(self):
-        with patch.object(app.time, "monotonic", return_value=100.75):
-            cleanup_deadline = app.make_ssh_cleanup_deadline(100.0)
-            wait_timeout = app.get_ssh_cleanup_wait_timeout(
+        with patch.object(ssh.time, "monotonic", return_value=100.75):
+            cleanup_deadline = ssh.make_ssh_cleanup_deadline(100.0)
+            wait_timeout = ssh.get_ssh_cleanup_wait_timeout(
                 cleanup_deadline,
                 timeout=1.0,
             )
@@ -244,16 +261,16 @@ class SSHConnectionTests(unittest.TestCase):
 
     def test_cleanup_thread_start_failure_is_non_fatal(self):
         with patch.object(
-            app.threading.Thread,
+            ssh.threading.Thread,
             "start",
             side_effect=RuntimeError("thread limit"),
         ):
-            completed = app.run_cleanup_with_timeout(lambda: None, 0.01)
+            completed = ssh.run_cleanup_with_timeout(lambda: None, 0.01)
 
         self.assertFalse(completed)
 
     def test_create_client_uses_separate_connection_timeouts(self):
-        key = app.get_ssh_cache_key(SERVER)
+        key = ssh.get_ssh_cache_key(SERVER)
         identity = ("/tmp/test-key", None, True)
         client = MagicMock()
         transport = make_transport()
@@ -267,10 +284,10 @@ class SSHConnectionTests(unittest.TestCase):
         )
 
         with (
-            patch.object(app.paramiko, "SSHClient", return_value=client),
-            patch.object(app, "get_ssh_settings", return_value=settings),
+            patch.object(ssh.paramiko, "SSHClient", return_value=client),
+            patch.object(ssh, "get_ssh_settings", return_value=settings),
         ):
-            created, was_reused = app.create_ssh_client(SERVER, key, identity)
+            created, was_reused = ssh.create_ssh_client(SERVER, key, identity)
 
         self.assertIs(created, client)
         self.assertFalse(was_reused)
@@ -293,38 +310,38 @@ class SSHConnectionTests(unittest.TestCase):
         connect_lock.acquire.return_value = False
 
         with (
-            patch.object(app, "get_cached_ssh_client", return_value=None),
-            patch.object(app, "get_ssh_connect_lock", return_value=connect_lock),
-            patch.object(app, "create_ssh_client") as create,
-            patch.object(app.time, "monotonic", return_value=10.0),
+            patch.object(ssh, "get_cached_ssh_client", return_value=None),
+            patch.object(ssh, "get_ssh_connect_lock", return_value=connect_lock),
+            patch.object(ssh, "create_ssh_client") as create,
+            patch.object(ssh.time, "monotonic", return_value=10.0),
         ):
             with self.assertRaisesRegex(
-                app.SSHOperationDeadlineExceeded, "connect queue deadline exceeded"
+                ssh.SSHOperationDeadlineExceeded, "connect queue deadline exceeded"
             ):
-                app.get_ssh_client(SERVER, deadline=15.0)
+                ssh.get_ssh_client(SERVER, deadline=15.0)
 
         connect_lock.acquire.assert_called_once_with(timeout=5.0)
         connect_lock.release.assert_not_called()
         create.assert_not_called()
 
     def test_connection_semaphore_wait_is_bounded_by_operation_deadline(self):
-        key = app.get_ssh_cache_key(SERVER)
+        key = ssh.get_ssh_cache_key(SERVER)
         identity = ("/tmp/test-key", None, True)
         semaphore = MagicMock()
         semaphore.acquire.return_value = False
         client = MagicMock()
 
         with (
-            patch.object(app, "ssh_connect_semaphore", semaphore),
-            patch.object(app.paramiko, "SSHClient", return_value=client),
-            patch.object(app, "get_ssh_settings", return_value=retry_settings()),
-            patch.object(app.time, "monotonic", return_value=10.0),
+            patch.object(ssh, "ssh_connect_semaphore", semaphore),
+            patch.object(ssh.paramiko, "SSHClient", return_value=client),
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(ssh.time, "monotonic", return_value=10.0),
         ):
             with self.assertRaisesRegex(
-                app.SSHOperationDeadlineExceeded,
+                ssh.SSHOperationDeadlineExceeded,
                 "connection semaphore deadline exceeded",
             ):
-                app.create_ssh_client(
+                ssh.create_ssh_client(
                     SERVER,
                     key,
                     identity,
@@ -338,10 +355,10 @@ class SSHConnectionTests(unittest.TestCase):
 
 class SSHCommandTests(unittest.TestCase):
     def setUp(self):
-        with app.ssh_lock:
-            app.ssh_clients.clear()
-            app.ssh_connect_locks.clear()
-            app.ssh_command_locks.clear()
+        with ssh.ssh_lock:
+            ssh.ssh_clients.clear()
+            ssh.ssh_connect_locks.clear()
+            ssh.ssh_command_locks.clear()
 
     def test_command_runner_drains_both_streams_and_uses_split_timeouts(self):
         channel = FakeChannel(stdout=b"out", stderr=b"err", status=7)
@@ -350,7 +367,7 @@ class SSHCommandTests(unittest.TestCase):
         client = make_client()
         client.get_transport.return_value = transport
 
-        result = app.run_ssh_command_status(
+        result = ssh.run_ssh_command_status(
             client,
             "test-command",
             timeout=12,
@@ -371,11 +388,11 @@ class SSHCommandTests(unittest.TestCase):
         channel.exit_status_ready = lambda: False
 
         with (
-            patch.object(app.time, "monotonic", side_effect=[0.0, 0.0, 2.0]),
-            patch.object(app.time, "sleep"),
+            patch.object(ssh.time, "monotonic", side_effect=[0.0, 0.0, 2.0]),
+            patch.object(ssh.time, "sleep"),
         ):
             with self.assertRaisesRegex(TimeoutError, "total timeout after 1s"):
-                app.read_ssh_channel(channel, idle_timeout=10, total_timeout=1)
+                ssh.read_ssh_channel(channel, idle_timeout=10, total_timeout=1)
 
     def test_exec_request_has_a_hard_timeout(self):
         release = threading.Event()
@@ -384,7 +401,7 @@ class SSHCommandTests(unittest.TestCase):
         channel.close.side_effect = release.set
 
         with self.assertRaisesRegex(TimeoutError, "exec request timeout"):
-            app.execute_ssh_channel_command(channel, "blocked", timeout=0.01)
+            ssh.execute_ssh_channel_command(channel, "blocked", timeout=0.01)
 
         channel.close.assert_called_once()
 
@@ -400,7 +417,7 @@ class SSHCommandTests(unittest.TestCase):
         started = time.monotonic()
         try:
             with self.assertRaisesRegex(TimeoutError, "exec request timeout"):
-                app.execute_ssh_channel_command(
+                ssh.execute_ssh_channel_command(
                     channel,
                     "blocked",
                     timeout=0.01,
@@ -421,7 +438,7 @@ class SSHCommandTests(unittest.TestCase):
 
         started = time.monotonic()
         with self.assertRaisesRegex(TimeoutError, "channel open timeout"):
-            app.open_ssh_session(
+            ssh.open_ssh_session(
                 transport,
                 timeout=0.01,
                 cleanup_timeout=0.01,
@@ -435,11 +452,11 @@ class SSHCommandTests(unittest.TestCase):
         clock = iter(i / 10 for i in range(100))
 
         with (
-            patch.object(app.time, "monotonic", side_effect=lambda: next(clock)),
-            patch.object(app.time, "sleep"),
+            patch.object(ssh.time, "monotonic", side_effect=lambda: next(clock)),
+            patch.object(ssh.time, "sleep"),
         ):
             with self.assertRaisesRegex(TimeoutError, "total timeout after 0.5s"):
-                app.read_ssh_channel(
+                ssh.read_ssh_channel(
                     channel,
                     idle_timeout=10,
                     total_timeout=0.5,
@@ -448,8 +465,8 @@ class SSHCommandTests(unittest.TestCase):
     def test_eof_waits_for_delayed_exit_status(self):
         channel = DelayedStatusChannel(status=3)
 
-        with patch.object(app.time, "sleep"):
-            status, out, err = app.read_ssh_channel(
+        with patch.object(ssh.time, "sleep"):
+            status, out, err = ssh.read_ssh_channel(
                 channel,
                 idle_timeout=1,
                 total_timeout=2,
@@ -462,14 +479,14 @@ class SSHCommandTests(unittest.TestCase):
         client = make_client()
 
         with (
-            patch.object(app, "get_ssh_settings", return_value=retry_settings()),
-            patch.object(app, "get_ssh_client", return_value=(client, True)),
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(ssh, "get_ssh_client", return_value=(client, True)),
             patch.object(
-                app, "run_ssh_command_status", return_value=(0, "ok", "")
+                ssh, "run_ssh_command_status", return_value=(0, "ok", "")
             ) as run_command,
-            patch.object(app.time, "monotonic", return_value=100.0),
+            patch.object(ssh.time, "monotonic", return_value=100.0),
         ):
-            result = app.run_server_ssh_command_status(
+            result = ssh.run_server_ssh_command_status(
                 SERVER,
                 "read-only",
                 operation_timeout=150,
@@ -485,14 +502,14 @@ class SSHCommandTests(unittest.TestCase):
         settings = retry_settings(channel_open_timeout=60.0)
 
         with (
-            patch.object(app, "get_ssh_settings", return_value=settings),
-            patch.object(app, "get_ssh_client", return_value=(client, False)),
+            patch.object(ssh, "get_ssh_settings", return_value=settings),
+            patch.object(ssh, "get_ssh_client", return_value=(client, False)),
             patch.object(
-                app, "run_ssh_command_status", return_value=(0, "ok", "")
+                ssh, "run_ssh_command_status", return_value=(0, "ok", "")
             ) as run_command,
-            patch.object(app.time, "monotonic", return_value=100.0),
+            patch.object(ssh.time, "monotonic", return_value=100.0),
         ):
-            result = app.run_server_ssh_command_status(
+            result = ssh.run_server_ssh_command_status(
                 SERVER,
                 "read-only",
                 operation_timeout=150,
@@ -503,31 +520,66 @@ class SSHCommandTests(unittest.TestCase):
         self.assertEqual(run_command.call_args.kwargs["channel_open_timeout"], 60.0)
         self.assertEqual(run_command.call_args.kwargs["deadline"], 250.0)
 
+    def test_command_namespace_uses_an_isolated_client_and_lock(self):
+        client = make_client()
+        with (
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(
+                ssh,
+                "get_ssh_client",
+                return_value=(client, False),
+            ) as get_client,
+            patch.object(
+                ssh,
+                "run_ssh_command_status",
+                return_value=(0, "ok", ""),
+            ),
+            patch.object(ssh.time, "monotonic", return_value=100.0),
+        ):
+            result = ssh.run_server_ssh_command_status(
+                SERVER,
+                "read-only",
+                operation_timeout=150,
+                retry_on_transport=True,
+                namespace="storage",
+            )
+
+        self.assertEqual(result, (0, "ok", ""))
+        get_client.assert_called_once_with(
+            SERVER,
+            deadline=250.0,
+            namespace="storage",
+        )
+        self.assertIn(
+            ssh.get_ssh_cache_key(SERVER, namespace="storage"),
+            ssh.ssh_command_locks,
+        )
+
     def test_retry_switches_reused_open_timeout_from_20_to_fresh_60(self):
         first_client = make_client()
         second_client = make_client()
         settings = retry_settings(channel_open_timeout=60.0)
-        open_failure = app.SSHCommandFailure(
+        open_failure = ssh.SSHCommandFailure(
             TimeoutError("channel open failed"),
-            app.SSH_STAGE_PRE_DISPATCH,
+            ssh.SSH_STAGE_PRE_DISPATCH,
         )
 
         with (
-            patch.object(app, "get_ssh_settings", return_value=settings),
+            patch.object(ssh, "get_ssh_settings", return_value=settings),
             patch.object(
-                app,
+                ssh,
                 "get_ssh_client",
                 side_effect=[(first_client, True), (second_client, False)],
             ),
             patch.object(
-                app,
+                ssh,
                 "run_ssh_command_status",
                 side_effect=[open_failure, (0, "ok", "")],
             ) as run_command,
-            patch.object(app, "invalidate_ssh_client"),
-            patch.object(app.time, "monotonic", return_value=100.0),
+            patch.object(ssh, "invalidate_ssh_client"),
+            patch.object(ssh.time, "monotonic", return_value=100.0),
         ):
-            result = app.run_server_ssh_command_status(
+            result = ssh.run_server_ssh_command_status(
                 SERVER,
                 "write-operation",
                 operation_timeout=150,
@@ -545,16 +597,16 @@ class SSHCommandTests(unittest.TestCase):
         command_lock.acquire.return_value = False
 
         with (
-            patch.object(app, "get_ssh_command_lock", return_value=command_lock),
-            patch.object(app, "get_ssh_settings", return_value=retry_settings()),
-            patch.object(app, "get_ssh_client") as get_client,
-            patch.object(app.time, "monotonic", return_value=10.0),
+            patch.object(ssh, "get_ssh_command_lock", return_value=command_lock),
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(ssh, "get_ssh_client") as get_client,
+            patch.object(ssh.time, "monotonic", return_value=10.0),
         ):
             with self.assertRaisesRegex(
-                app.SSHOperationDeadlineExceeded,
+                ssh.SSHOperationDeadlineExceeded,
                 "command queue deadline exceeded",
             ):
-                app.run_server_ssh_command_status(
+                ssh.run_server_ssh_command_status(
                     SERVER,
                     "read-only",
                     operation_timeout=5,
@@ -572,28 +624,28 @@ class SSHCommandTests(unittest.TestCase):
             retry_backoff_max=2.0,
             retry_jitter=0.0,
         )
-        open_failure = app.SSHCommandFailure(
+        open_failure = ssh.SSHCommandFailure(
             TimeoutError("channel open failed"),
-            app.SSH_STAGE_PRE_DISPATCH,
+            ssh.SSH_STAGE_PRE_DISPATCH,
         )
 
         with (
-            patch.object(app, "get_ssh_settings", return_value=settings),
+            patch.object(ssh, "get_ssh_settings", return_value=settings),
             patch.object(
-                app, "get_ssh_client", return_value=(client, True)
+                ssh, "get_ssh_client", return_value=(client, True)
             ) as get_client,
             patch.object(
-                app, "run_ssh_command_status", side_effect=open_failure
+                ssh, "run_ssh_command_status", side_effect=open_failure
             ) as run_command,
-            patch.object(app, "invalidate_ssh_client"),
-            patch.object(app.time, "monotonic", return_value=100.0),
-            patch.object(app.time, "sleep") as sleep,
+            patch.object(ssh, "invalidate_ssh_client"),
+            patch.object(ssh.time, "monotonic", return_value=100.0),
+            patch.object(ssh.time, "sleep") as sleep,
         ):
             with self.assertRaisesRegex(
-                app.SSHOperationDeadlineExceeded,
+                ssh.SSHOperationDeadlineExceeded,
                 "retry backoff deadline exceeded",
             ):
-                app.run_server_ssh_command_status(
+                ssh.run_server_ssh_command_status(
                     SERVER,
                     "read-only",
                     operation_timeout=1,
@@ -615,20 +667,20 @@ class SSHCommandTests(unittest.TestCase):
             }
         )
 
-        self.assertTrue(app.is_retryable_ssh_transport_error(error))
+        self.assertTrue(ssh.is_retryable_ssh_transport_error(error))
 
         with (
-            patch.object(app, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
             patch.object(
-                app,
+                ssh,
                 "get_ssh_client",
                 side_effect=[error, (client, False)],
             ) as get_client,
             patch.object(
-                app, "run_ssh_command_status", return_value=(0, "ok", "")
+                ssh, "run_ssh_command_status", return_value=(0, "ok", "")
             ) as run_command,
         ):
-            result = app.run_server_ssh_command_status(
+            result = ssh.run_server_ssh_command_status(
                 SERVER,
                 "write-operation",
                 retry_on_transport=False,
@@ -644,20 +696,20 @@ class SSHCommandTests(unittest.TestCase):
         channel = FakeChannel(status=0)
 
         with (
-            patch.object(app, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
             patch.object(
-                app,
+                ssh,
                 "get_ssh_client",
                 side_effect=[(first_client, True), (second_client, False)],
             ) as get_client,
             patch.object(
-                app,
+                ssh,
                 "open_ssh_session",
                 side_effect=[TimeoutError("open failed"), channel],
             ) as open_session,
-            patch.object(app, "invalidate_ssh_client"),
+            patch.object(ssh, "invalidate_ssh_client"),
         ):
-            result = app.run_server_ssh_command_status(
+            result = ssh.run_server_ssh_command_status(
                 SERVER,
                 "write-operation",
                 retry_on_transport=False,
@@ -676,17 +728,17 @@ class SSHCommandTests(unittest.TestCase):
 
         channel.exec_command = fail_exec
         with (
-            patch.object(app, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
             patch.object(
-                app, "get_ssh_client", return_value=(client, True)
+                ssh, "get_ssh_client", return_value=(client, True)
             ) as get_client,
-            patch.object(app, "open_ssh_session", return_value=channel),
-            patch.object(app, "invalidate_ssh_client"),
+            patch.object(ssh, "open_ssh_session", return_value=channel),
+            patch.object(ssh, "invalidate_ssh_client"),
         ):
             with self.assertRaisesRegex(
-                app.SSHCommandOutcomeUnknown, "remote command outcome is unknown"
+                ssh.SSHCommandOutcomeUnknown, "remote command outcome is unknown"
             ):
-                app.run_server_ssh_command_status(
+                ssh.run_server_ssh_command_status(
                     SERVER,
                     "write-operation",
                     retry_on_transport=False,
@@ -699,20 +751,20 @@ class SSHCommandTests(unittest.TestCase):
         channel = FakeChannel(status=0)
 
         with (
-            patch.object(app, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
             patch.object(
-                app, "get_ssh_client", return_value=(client, True)
+                ssh, "get_ssh_client", return_value=(client, True)
             ) as get_client,
-            patch.object(app, "open_ssh_session", return_value=channel),
+            patch.object(ssh, "open_ssh_session", return_value=channel),
             patch.object(
-                app, "read_ssh_channel", side_effect=TimeoutError("read failed")
+                ssh, "read_ssh_channel", side_effect=TimeoutError("read failed")
             ),
-            patch.object(app, "invalidate_ssh_client"),
+            patch.object(ssh, "invalidate_ssh_client"),
         ):
             with self.assertRaisesRegex(
-                app.SSHCommandOutcomeUnknown, "remote command outcome is unknown"
+                ssh.SSHCommandOutcomeUnknown, "remote command outcome is unknown"
             ):
-                app.run_server_ssh_command_status(
+                ssh.run_server_ssh_command_status(
                     SERVER,
                     "write-operation",
                     retry_on_transport=False,
@@ -724,26 +776,26 @@ class SSHCommandTests(unittest.TestCase):
         first_client = make_client()
         second_client = make_client()
         settings = retry_settings()
-        dispatched_failure = app.SSHCommandFailure(
-            TimeoutError(), app.SSH_STAGE_DISPATCHED
+        dispatched_failure = ssh.SSHCommandFailure(
+            TimeoutError(), ssh.SSH_STAGE_DISPATCHED
         )
 
         with (
-            patch.object(app, "get_ssh_settings", return_value=settings),
+            patch.object(ssh, "get_ssh_settings", return_value=settings),
             patch.object(
-                app,
+                ssh,
                 "get_ssh_client",
                 side_effect=[(first_client, True), (second_client, False)],
             ) as get_client,
             patch.object(
-                app,
+                ssh,
                 "run_ssh_command_status",
                 side_effect=[dispatched_failure, (0, "ok", "")],
             ) as run_command,
-            patch.object(app, "invalidate_ssh_client") as invalidate,
-            patch.object(app.time, "sleep"),
+            patch.object(ssh, "invalidate_ssh_client") as invalidate,
+            patch.object(ssh.time, "sleep"),
         ):
-            result = app.run_server_ssh_command_status(
+            result = ssh.run_server_ssh_command_status(
                 SERVER,
                 "read-only",
                 retry_on_transport=True,
@@ -761,24 +813,24 @@ class SSHCommandTests(unittest.TestCase):
 
     def test_write_command_is_not_replayed_after_transport_failure(self):
         client = make_client()
-        dispatched_failure = app.SSHCommandFailure(
-            TimeoutError(), app.SSH_STAGE_DISPATCHED
+        dispatched_failure = ssh.SSHCommandFailure(
+            TimeoutError(), ssh.SSH_STAGE_DISPATCHED
         )
 
         with (
-            patch.object(app, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
             patch.object(
-                app, "get_ssh_client", return_value=(client, True)
+                ssh, "get_ssh_client", return_value=(client, True)
             ) as get_client,
             patch.object(
-                app, "run_ssh_command_status", side_effect=dispatched_failure
+                ssh, "run_ssh_command_status", side_effect=dispatched_failure
             ) as run_command,
-            patch.object(app, "invalidate_ssh_client") as invalidate,
+            patch.object(ssh, "invalidate_ssh_client") as invalidate,
         ):
             with self.assertRaisesRegex(
-                app.SSHCommandOutcomeUnknown, "remote command outcome is unknown"
+                ssh.SSHCommandOutcomeUnknown, "remote command outcome is unknown"
             ):
-                app.run_server_ssh_command_status(
+                ssh.run_server_ssh_command_status(
                     SERVER,
                     "write-operation",
                     retry_on_transport=False,
@@ -797,20 +849,20 @@ class SSHCommandTests(unittest.TestCase):
         client = make_client()
 
         with (
-            patch.object(app, "get_ssh_settings", return_value=retry_settings()),
-            patch.object(app, "get_ssh_client", return_value=(client, True)),
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(ssh, "get_ssh_client", return_value=(client, True)),
             patch.object(
-                app,
+                ssh,
                 "run_ssh_command_status",
                 side_effect=TimeoutError("unexpected runner failure"),
             ) as run_command,
-            patch.object(app, "invalidate_ssh_client"),
+            patch.object(ssh, "invalidate_ssh_client"),
         ):
             with self.assertRaisesRegex(
-                app.SSHCommandOutcomeUnknown,
+                ssh.SSHCommandOutcomeUnknown,
                 "remote command outcome is unknown",
             ):
-                app.run_server_ssh_command_status(
+                ssh.run_server_ssh_command_status(
                     SERVER,
                     "write-operation",
                     retry_on_transport=False,
@@ -822,18 +874,18 @@ class SSHCommandTests(unittest.TestCase):
         client = make_client()
 
         with (
-            patch.object(app, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
             patch.object(
-                app,
+                ssh,
                 "get_ssh_client",
                 side_effect=[TimeoutError(), (client, False)],
             ) as get_client,
             patch.object(
-                app, "run_ssh_command_status", return_value=(0, "ok", "")
+                ssh, "run_ssh_command_status", return_value=(0, "ok", "")
             ) as run_command,
-            patch.object(app.time, "sleep"),
+            patch.object(ssh.time, "sleep"),
         ):
-            result = app.run_server_ssh_command_status(
+            result = ssh.run_server_ssh_command_status(
                 SERVER,
                 "write-operation",
                 retry_on_transport=False,
@@ -846,16 +898,16 @@ class SSHCommandTests(unittest.TestCase):
 
     def test_authentication_error_is_not_retried(self):
         with (
-            patch.object(app, "get_ssh_settings", return_value=retry_settings()),
+            patch.object(ssh, "get_ssh_settings", return_value=retry_settings()),
             patch.object(
-                app,
+                ssh,
                 "get_ssh_client",
                 side_effect=paramiko.AuthenticationException("denied"),
             ) as get_client,
-            patch.object(app.time, "sleep") as sleep,
+            patch.object(ssh.time, "sleep") as sleep,
         ):
             with self.assertRaises(paramiko.AuthenticationException):
-                app.run_server_ssh_command_status(
+                ssh.run_server_ssh_command_status(
                     SERVER,
                     "read-only",
                     retry_on_transport=True,
