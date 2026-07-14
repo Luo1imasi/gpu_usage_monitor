@@ -47,11 +47,108 @@
             font-weight: 500;
         }
         
-        .servers {
+        .monitor-panel {
+            background: #252526;
+            border: 1px solid #3c3c3c;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
+        }
+
+        .monitor-heading {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 14px;
+        }
+
+        .monitor-title {
+            color: #fff;
+            font-size: 1.05em;
+            font-weight: 500;
+        }
+
+        .monitor-description {
+            color: #858585;
+            font-size: 0.75em;
+            margin-top: 3px;
+        }
+
+        .monitor-heading-meta {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .monitor-update {
+            color: #858585;
+            font-size: 0.72em;
+            white-space: nowrap;
+            text-align: right;
+        }
+
+        .monitor-grid {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 16px;
+            gap: 12px;
             align-items: start;
+        }
+
+        .monitor-card {
+            min-width: 0;
+            overflow: hidden;
+            align-self: start;
+            background: #1e1e1e;
+            border: 1px solid #3c3c3c;
+            border-radius: 6px;
+        }
+
+        .monitor-card[open] {
+            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+        }
+
+        .monitor-card > summary {
+            list-style: none;
+            cursor: pointer;
+        }
+
+        .monitor-card > summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .monitor-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            min-height: 48px;
+            gap: 12px;
+            padding: 11px 14px;
+            border-bottom: 1px solid transparent;
+            transition: background 0.2s ease, border-color 0.2s ease;
+        }
+
+        .monitor-card[open] .monitor-card-header {
+            border-bottom-color: #3c3c3c;
+        }
+
+        .monitor-card > summary:hover .monitor-card-header {
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .monitor-card-meta {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            flex-wrap: wrap;
+            gap: 7px;
+        }
+
+        .monitor-card[open] .monitor-card-header .collapse-caret {
+            transform: rotate(90deg);
         }
 
         .access-panel {
@@ -61,6 +158,57 @@
             padding: 16px;
             margin-bottom: 16px;
             box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
+        }
+
+        .management-panel {
+            overflow: hidden;
+            padding: 0;
+        }
+
+        .management-panel > summary {
+            list-style: none;
+            cursor: pointer;
+        }
+
+        .management-panel > summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .management-summary {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            padding: 13px 16px;
+            transition: background 0.2s ease;
+        }
+
+        .management-panel > summary:hover .management-summary {
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .management-title {
+            color: #fff;
+            font-size: 0.95em;
+            font-weight: 500;
+        }
+
+        .management-description {
+            color: #6d6d6d;
+            font-size: 0.72em;
+            margin-top: 2px;
+        }
+
+        .management-panel[open] .management-summary {
+            border-bottom: 1px solid #3c3c3c;
+        }
+
+        .management-panel[open] .management-caret {
+            transform: rotate(90deg);
+        }
+
+        .management-body {
+            padding: 16px;
         }
 
         .access-tools {
@@ -434,20 +582,237 @@
         .access-error {
             color: #f14c4c;
         }
-        
-        .server-card {
-            background: #252526;
-            border-radius: 6px;
-            border: 1px solid #3c3c3c;
+
+        .gpu-item.storage-item {
+            grid-column: 1 / -1;
+            min-width: 0;
+            background: #1b201f;
+            border-color: #35534c;
+            border-left: 3px solid #4ec9b0;
+        }
+
+        .gpu-item.storage-item[open] {
+            border-color: #3f655d;
+            border-left-color: #4ec9b0;
+        }
+
+        .storage-header {
+            background: rgba(78, 201, 176, 0.035);
+        }
+
+        .gpu-item.storage-item > summary:hover .storage-header {
+            background: rgba(78, 201, 176, 0.075);
+        }
+
+        .storage-item .gpu-name {
+            color: #4ec9b0;
+        }
+
+        .storage-item .gpu-id {
+            color: #829690;
+        }
+
+        .storage-item .summary-count {
+            background: #1b211f;
+            border-color: #344b46;
+        }
+
+        .storage-title-group {
+            display: flex;
+            align-items: center;
+            min-width: 0;
+            gap: 8px;
+        }
+
+        .storage-summary-capacity {
+            max-width: 160px;
             overflow: hidden;
-            align-self: start;
+            text-overflow: ellipsis;
         }
 
-        .server-card[open] {
-            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+        .storage-metrics {
+            padding-top: 2px;
         }
 
-        .server-card > summary,
+        .progress-fill.storage {
+            background: #4ec9b0;
+        }
+
+        .progress-fill.storage.high {
+            background: #dcdcaa;
+        }
+
+        .progress-fill.storage.critical {
+            background: #f14c4c;
+        }
+
+        .storage-available {
+            overflow: hidden;
+            margin-top: 4px;
+            color: #6d6d6d;
+            font-family: monospace;
+            font-size: 0.68em;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .storage-detail-meta {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 10px;
+            padding: 0 12px 9px;
+            color: #6d6d6d;
+            font-size: 0.67em;
+        }
+
+        .storage-card-alert {
+            margin: 0 12px 9px;
+            padding: 7px 8px;
+            color: #dcdcaa;
+            background: rgba(220, 220, 170, 0.07);
+            border: 1px solid rgba(220, 220, 170, 0.25);
+            border-radius: 4px;
+            font-size: 0.69em;
+            line-height: 1.35;
+        }
+
+        .storage-card-alert.error {
+            color: #f14c4c;
+            background: rgba(241, 76, 76, 0.07);
+            border-color: rgba(241, 76, 76, 0.25);
+            padding: 7px 8px;
+            text-align: left;
+        }
+
+        .storage-users-heading {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border-top: 1px solid #3c3c3c;
+            color: #858585;
+            font-size: 0.69em;
+        }
+
+        .storage-users-title {
+            color: #cccccc;
+            font-weight: 500;
+        }
+
+        .storage-users-filter {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .storage-user-list {
+            max-height: 236px;
+            overflow-x: hidden;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            scrollbar-width: thin;
+            scrollbar-color: #46504d transparent;
+            padding: 0 12px 10px;
+        }
+
+        .storage-user-list::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        .storage-user-list::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .storage-user-list::-webkit-scrollbar-thumb {
+            background: #46504d;
+            background-clip: padding-box;
+            border: 2px solid transparent;
+            border-radius: 999px;
+        }
+
+        .storage-user-list::-webkit-scrollbar-thumb:hover {
+            background-color: #66736f;
+        }
+
+        .storage-user-row {
+            display: grid;
+            grid-template-columns: 26px minmax(0, 1fr) auto;
+            gap: 8px;
+            align-items: center;
+            padding: 6px 8px;
+            margin-bottom: 3px;
+            background: #252526;
+            border-radius: 3px;
+            font-size: 0.76em;
+        }
+
+        .storage-user-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .storage-user-rank {
+            color: #6d6d6d;
+            font-family: monospace;
+            text-align: right;
+        }
+
+        .storage-user-main {
+            min-width: 0;
+        }
+
+        .storage-user-name {
+            overflow: hidden;
+            color: #9cdcfe;
+            font-weight: 500;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .storage-user-bar {
+            height: 2px;
+            overflow: hidden;
+            margin-top: 4px;
+            background: #333333;
+            border-radius: 1px;
+        }
+
+        .storage-user-bar-fill {
+            height: 100%;
+            background: #4ec9b0;
+            border-radius: 1px;
+        }
+
+        .storage-user-size {
+            color: #b5cea8;
+            font-family: monospace;
+            text-align: right;
+            white-space: nowrap;
+        }
+
+        .storage-user-error {
+            color: #f14c4c;
+        }
+
+        .storage-card-state,
+        .storage-empty {
+            padding: 12px;
+            color: #6d6d6d;
+            font-size: 0.75em;
+            text-align: center;
+        }
+
+        .storage-card-state {
+            min-height: 76px;
+            display: grid;
+            place-items: center;
+            line-height: 1.45;
+        }
+
         .gpu-item > summary,
         .process-list > summary,
         .access-section > summary {
@@ -455,28 +820,12 @@
             cursor: pointer;
         }
 
-        .server-card > summary::-webkit-details-marker,
         .gpu-item > summary::-webkit-details-marker,
         .process-list > summary::-webkit-details-marker,
         .access-section > summary::-webkit-details-marker {
             display: none;
         }
-        
-        .server-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 12px;
-            padding: 14px 16px;
-            border-bottom: 1px solid transparent;
-            transition: background 0.2s ease, border-color 0.2s ease;
-        }
 
-        .server-card[open] .server-header {
-            border-bottom-color: #3c3c3c;
-        }
-
-        .server-card > summary:hover .server-header,
         .gpu-item > summary:hover .gpu-header,
         .process-list > summary:hover .process-title,
         .access-section > summary:hover .access-header {
@@ -521,13 +870,24 @@
             border: 1px solid #dcdcaa;
         }
 
+        .status.partial {
+            background: #3c3c3c;
+            color: #ce9178;
+            border: 1px solid #ce9178;
+        }
+
+        .status.loading {
+            background: #3c3c3c;
+            color: #9cdcfe;
+            border: 1px solid #9cdcfe;
+        }
+
         .stale-warning {
             margin: 8px 12px 0;
             color: #dcdcaa;
             font-size: 0.78em;
         }
 
-        .server-summary-meta,
         .gpu-summary-meta {
             display: flex;
             align-items: center;
@@ -552,7 +912,6 @@
             transition: transform 0.2s ease;
         }
 
-        .server-card[open] .server-header .collapse-caret,
         .gpu-item[open] .gpu-header .collapse-caret,
         .process-list[open] .process-title .collapse-caret,
         .access-section[open] .access-header .collapse-caret {
@@ -562,6 +921,7 @@
         .gpu-list {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
+            align-items: start;
             gap: 12px;
             padding: 14px 16px 16px;
         }
@@ -588,9 +948,35 @@
         }
 
         @media (max-width: 980px) {
-            .servers,
+            .monitor-grid,
             .gpu-list {
                 grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 640px) {
+            .monitor-heading {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+
+            .monitor-heading-meta,
+            .monitor-update {
+                justify-content: flex-start;
+                text-align: left;
+            }
+
+            .monitor-card-header {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+
+            .monitor-card-meta {
+                justify-content: flex-start;
+            }
+
+            .storage-user-list {
+                max-height: 210px;
             }
         }
         
@@ -702,14 +1088,6 @@
             text-align: center;
         }
         
-        .refresh-info {
-            text-align: center;
-            color: #6d6d6d;
-            font-size: 0.75em;
-            margin-top: 20px;
-            padding-top: 12px;
-            border-top: 1px solid #3c3c3c;
-        }
     </style>
 </head>
 <body>
@@ -722,7 +1100,30 @@
                 <span>Processes: <span class="stat-value" id="total-processes">-</span></span>
             </div>
         </header>
-        <div class="access-panel">
+        <section class="monitor-panel gpu-panel" aria-labelledby="gpu-title">
+            <div class="monitor-heading">
+                <div>
+                    <h2 class="monitor-title" id="gpu-title">GPU 占用</h2>
+                    <div class="monitor-description">服务器 GPU、显存与运行进程</div>
+                </div>
+                <div class="monitor-heading-meta">
+                    <span class="monitor-update">采样：<span id="last-update">-</span></span>
+                    <span class="monitor-update">刷新：<span id="interval">-</span>s</span>
+                </div>
+            </div>
+            <div class="servers monitor-grid" id="servers">Loading...</div>
+        </section>
+        <details class="access-panel management-panel">
+            <summary>
+                <div class="management-summary">
+                    <div>
+                        <div class="management-title">用户与访问管理</div>
+                        <div class="management-description">SSH Key、账号导入与服务器访问权限</div>
+                    </div>
+                    <span class="collapse-caret management-caret" aria-hidden="true">›</span>
+                </div>
+            </summary>
+            <div class="management-body">
             <div class="access-tools">
                 <div class="access-tool-card">
                     <div class="access-tool-card-header">
@@ -795,9 +1196,8 @@
                     <div class="access-placeholder">未获取：点击“获取权限矩阵”手动加载</div>
                 </div>
             </details>
-        </div>
-        <div class="servers" id="servers">Loading...</div>
-        <div class="refresh-info">Refresh: <span id="interval">-</span>s | Sample: <span id="last-update">-</span></div>
+            </div>
+        </details>
     </div>
     
     <script>
@@ -806,16 +1206,17 @@
         let configuredServers = [];
         let latestAccessMatrix = null;
         let latestDetectedUserItems = [];
+        let latestGpuData = null;
+        let storageByServer = new Map();
+        let storageFetchError = false;
+        let gpuRequestSequence = 0;
+        let storageRequestSequence = 0;
         let adminToken = '';
         let adminTokenPromptDismissed = false;
+        let hasStorageData = false;
         const collapseState = new Map();
+        const storageScrollState = new Map();
         
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-
         function getSavedOpenState(key, defaultOpen) {
             return collapseState.has(key) ? collapseState.get(key) : defaultOpen;
         }
@@ -836,6 +1237,34 @@
                 return 0;
             }
             return Math.min(100, Math.max(0, numericValue));
+        }
+
+        function formatBytes(value) {
+            if (value === null || value === undefined || value === '') {
+                return '-';
+            }
+            const bytes = Number(value);
+            if (!Number.isFinite(bytes) || bytes < 0) {
+                return '-';
+            }
+            if (bytes === 0) {
+                return '0 B';
+            }
+            const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+            const unitIndex = Math.min(
+                Math.floor(Math.log(bytes) / Math.log(1024)),
+                units.length - 1
+            );
+            const scaled = bytes / Math.pow(1024, unitIndex);
+            const digits = scaled >= 100 || unitIndex === 0 ? 0 : (scaled >= 10 ? 1 : 2);
+            return scaled.toFixed(digits) + ' ' + units[unitIndex];
+        }
+
+        function formatSampleTime(timestamp) {
+            const numericTimestamp = Number(timestamp);
+            return Number.isFinite(numericTimestamp) && numericTimestamp > 0
+                ? new Date(numericTimestamp * 1000).toLocaleString()
+                : '-';
         }
 
         function createCaret() {
@@ -952,14 +1381,26 @@
                 document.getElementById('interval').textContent = refreshInterval;
             }
             
-            await refresh();
+            await Promise.all([refresh(), refreshStorage()]);
             setInterval(refresh, apiPollInterval * 1000);
+            setInterval(refreshStorage, 60000);
         }
         
         async function refresh() {
+            const requestSequence = ++gpuRequestSequence;
             try {
                 const r = await fetch('/api/gpu');
+                if (!r.ok) {
+                    throw new Error('HTTP ' + r.status);
+                }
                 const data = await r.json();
+                if (!Array.isArray(data)) {
+                    throw new Error('Invalid GPU response');
+                }
+                if (requestSequence !== gpuRequestSequence) {
+                    return;
+                }
+                latestGpuData = data;
                 render(data);
                 const sampleTimes = data
                     .map(server => Number(server.updated_at))
@@ -968,13 +1409,391 @@
                     ? new Date(Math.max(...sampleTimes) * 1000).toLocaleString()
                     : '-';
             } catch(e) {
-                const serversDiv = document.getElementById('servers');
-                serversDiv.innerHTML = '';
-                const errorDiv = document.createElement('div');
-                errorDiv.className = 'error';
-                errorDiv.textContent = 'Failed to fetch data';
-                serversDiv.appendChild(errorDiv);
+                if (requestSequence !== gpuRequestSequence) {
+                    return;
+                }
+                if (!latestGpuData) {
+                    if (storageByServer.size > 0) {
+                        latestGpuData = [];
+                        render(latestGpuData);
+                    } else {
+                        const serversDiv = document.getElementById('servers');
+                        serversDiv.innerHTML = '';
+                        const errorDiv = document.createElement('div');
+                        errorDiv.className = 'error';
+                        errorDiv.textContent = 'Failed to fetch data';
+                        serversDiv.appendChild(errorDiv);
+                    }
+                }
             }
+        }
+
+        async function refreshStorage() {
+            const requestSequence = ++storageRequestSequence;
+            try {
+                const response = await fetch('/api/storage');
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+                const data = await response.json();
+                if (!Array.isArray(data)) {
+                    throw new Error('Invalid storage response');
+                }
+                if (requestSequence !== storageRequestSequence) {
+                    return;
+                }
+                storageByServer = new Map(
+                    data
+                        .filter(server => server && typeof server.server === 'string')
+                        .map(server => [server.server, server])
+                );
+                hasStorageData = true;
+                storageFetchError = false;
+            } catch(e) {
+                if (requestSequence !== storageRequestSequence) {
+                    return;
+                }
+                storageFetchError = true;
+            }
+            if (latestGpuData) {
+                render(latestGpuData);
+            } else if (storageByServer.size > 0) {
+                render([]);
+            }
+        }
+
+        function toStorageBytes(value) {
+            if (value === null || value === undefined || value === '') {
+                return null;
+            }
+            const numericValue = Number(value);
+            return Number.isFinite(numericValue) && numericValue >= 0
+                ? numericValue
+                : null;
+        }
+
+        function formatStorageThreshold(value) {
+            const threshold = toStorageBytes(value);
+            if (threshold === null) {
+                return '用户阈值：-';
+            }
+            return threshold > 0
+                ? '仅显示 ≥ ' + formatBytes(threshold)
+                : '显示全部用户';
+        }
+
+        function getStorageStatus(server) {
+            const waiting = !server.filesystem
+                && !server.updated_at
+                && (!server.error || server.error === 'Waiting for first sample');
+            if (waiting) {
+                return {key: 'loading', label: 'Loading', waiting: true};
+            }
+            if (server.error) {
+                return {key: 'offline', label: 'Error', waiting: false};
+            }
+            if (server.stale) {
+                return {key: 'stale', label: 'Stale', waiting: false};
+            }
+            if (server.partial) {
+                return {key: 'partial', label: 'Partial', waiting: false};
+            }
+            if (!server.filesystem) {
+                return {key: 'offline', label: 'Unavailable', waiting: false};
+            }
+            return {key: 'online', label: 'Online', waiting: false};
+        }
+
+        function renderStorageUsers(card, server, scrollSnapshot) {
+            const users = Array.isArray(server.users) ? server.users : [];
+            const filteredCount = toStorageBytes(server.filtered_user_count) || 0;
+            const heading = document.createElement('div');
+            heading.className = 'storage-users-heading';
+            const title = document.createElement('span');
+            title.className = 'storage-users-title';
+            title.textContent = '用户占用排名 (' + users.length + ')';
+            const filter = document.createElement('span');
+            filter.className = 'storage-users-filter';
+            filter.textContent = formatStorageThreshold(server.user_min_bytes)
+                + (filteredCount ? ' · 已过滤 ' + filteredCount : '');
+            filter.title = filter.textContent;
+            heading.appendChild(title);
+            heading.appendChild(filter);
+            card.appendChild(heading);
+
+            if (users.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'storage-empty';
+                empty.textContent = filteredCount
+                    ? '没有达到显示阈值的用户目录'
+                    : '没有可显示的用户目录';
+                card.appendChild(empty);
+                return;
+            }
+
+            const sortedUsers = [...users].sort((left, right) => {
+                const leftUsed = toStorageBytes(left.used);
+                const rightUsed = toStorageBytes(right.used);
+                if (leftUsed !== null && rightUsed !== null && leftUsed !== rightUsed) {
+                    return rightUsed - leftUsed;
+                }
+                if ((leftUsed !== null) !== (rightUsed !== null)) {
+                    return leftUsed !== null ? -1 : 1;
+                }
+                return String(left.username || '').localeCompare(String(right.username || ''));
+            });
+            const largestUsage = sortedUsers.reduce((largest, user) => {
+                const used = toStorageBytes(user.used);
+                return used === null ? largest : Math.max(largest, used);
+            }, 0);
+            const list = document.createElement('div');
+            list.className = 'storage-user-list';
+            list.setAttribute('role', 'region');
+            list.setAttribute('aria-label', (server.server || '服务器') + ' 用户目录占用排名');
+            list.tabIndex = 0;
+            const scrollKey = 'storage-users:' + (server.server || '-');
+            const restoreScrollTop = scrollSnapshot && scrollSnapshot.has(scrollKey)
+                ? scrollSnapshot.get(scrollKey)
+                : (storageScrollState.get(scrollKey) || 0);
+            list.dataset.focusKey = scrollKey;
+            list.dataset.restoreScrollTop = String(restoreScrollTop);
+
+            sortedUsers.forEach((user, index) => {
+                const usedBytes = toStorageBytes(user.used);
+                const row = document.createElement('div');
+                row.className = 'storage-user-row';
+                const rank = document.createElement('span');
+                rank.className = 'storage-user-rank';
+                rank.textContent = String(index + 1).padStart(2, '0');
+                const main = document.createElement('div');
+                main.className = 'storage-user-main';
+                const username = document.createElement('div');
+                username.className = 'storage-user-name';
+                username.textContent = user.username || '-';
+                username.title = user.username || '-';
+                const bar = document.createElement('div');
+                bar.className = 'storage-user-bar';
+                const barFill = document.createElement('div');
+                barFill.className = 'storage-user-bar-fill';
+                barFill.style.width = usedBytes !== null && largestUsage > 0
+                    ? clampPercent(usedBytes / largestUsage * 100) + '%'
+                    : '0%';
+                bar.appendChild(barFill);
+                main.appendChild(username);
+                main.appendChild(bar);
+                const used = document.createElement('span');
+                used.className = user.error
+                    ? 'storage-user-size storage-user-error'
+                    : 'storage-user-size';
+                used.textContent = user.error ? '不可用' : formatBytes(usedBytes);
+                if (user.error) {
+                    used.title = user.error;
+                }
+                row.appendChild(rank);
+                row.appendChild(main);
+                row.appendChild(used);
+                list.appendChild(row);
+            });
+            card.appendChild(list);
+            list.addEventListener('scroll', () => {
+                storageScrollState.set(scrollKey, list.scrollTop);
+            });
+        }
+
+        function renderServerStorage(serverName, scrollSnapshot) {
+                const cachedServer = storageByServer.get(serverName);
+                const server = cachedServer || {
+                    server: serverName,
+                    filesystem: null,
+                    users: [],
+                    user_min_bytes: null,
+                    filtered_user_count: 0,
+                    partial: false,
+                    user_error_count: 0,
+                    updated_at: null,
+                    stale: false,
+                    last_error: null,
+                    error: storageFetchError
+                        ? '存储接口暂时不可用'
+                        : (hasStorageData ? '没有匹配的存储采样' : 'Waiting for first sample')
+                };
+                const card = document.createElement('details');
+                card.className = 'gpu-item storage-item';
+                const storageKey = 'server:' + serverName + ':storage';
+                card.open = getSavedOpenState(storageKey, false);
+                rememberOpenState(card, storageKey);
+                const summary = document.createElement('summary');
+                summary.dataset.focusKey = storageKey + ':summary';
+                const header = document.createElement('div');
+                header.className = 'gpu-header storage-header';
+                const serverTitle = document.createElement('div');
+                serverTitle.className = 'storage-title-group';
+                const name = document.createElement('span');
+                name.className = 'gpu-name';
+                name.textContent = 'Storage';
+                const path = document.createElement('span');
+                path.className = 'gpu-id';
+                path.textContent = server.filesystem && server.filesystem.path
+                    ? server.filesystem.path
+                    : '/home';
+                path.title = '采样 ' + formatSampleTime(server.updated_at);
+                serverTitle.appendChild(name);
+                serverTitle.appendChild(path);
+                const filesystem = server.filesystem;
+                const storageStatus = getStorageStatus(server);
+                const meta = document.createElement('div');
+                meta.className = 'gpu-summary-meta';
+                if (filesystem) {
+                    const percentSummary = document.createElement('span');
+                    percentSummary.className = 'summary-count';
+                    percentSummary.textContent = 'Disk '
+                        + clampPercent(filesystem.percent).toFixed(1) + '%';
+                    const capacitySummary = document.createElement('span');
+                    capacitySummary.className = 'summary-count storage-summary-capacity';
+                    capacitySummary.textContent = formatBytes(filesystem.used)
+                        + '/' + formatBytes(filesystem.total);
+                    capacitySummary.title = '已用 / 总量';
+                    meta.appendChild(percentSummary);
+                    meta.appendChild(capacitySummary);
+                } else {
+                    const capacitySummary = document.createElement('span');
+                    capacitySummary.className = 'summary-count';
+                    capacitySummary.textContent = storageStatus.waiting
+                        ? '等待采样'
+                        : '容量不可用';
+                    meta.appendChild(capacitySummary);
+                }
+                const usersSummary = document.createElement('span');
+                usersSummary.className = 'summary-count';
+                usersSummary.textContent = (Array.isArray(server.users) ? server.users.length : 0)
+                    + ' users';
+                const status = document.createElement('span');
+                status.className = 'status ' + storageStatus.key;
+                status.textContent = storageStatus.label;
+                const caret = createCaret();
+                meta.appendChild(usersSummary);
+                if (storageStatus.key !== 'online') {
+                    meta.appendChild(status);
+                }
+                meta.appendChild(caret);
+                header.appendChild(serverTitle);
+                header.appendChild(meta);
+                summary.appendChild(header);
+                card.appendChild(summary);
+
+                if (filesystem) {
+                    const percent = clampPercent(filesystem.percent);
+                    const metrics = document.createElement('div');
+                    metrics.className = 'metrics storage-metrics';
+
+                    const usageBox = document.createElement('div');
+                    usageBox.className = 'metric-box';
+                    const usageLabel = document.createElement('div');
+                    usageLabel.className = 'metric-label';
+                    usageLabel.textContent = 'Storage';
+                    const usageValue = document.createElement('div');
+                    usageValue.className = 'metric-value';
+                    usageValue.textContent = percent.toFixed(1) + '% used';
+                    const usageProgress = document.createElement('div');
+                    usageProgress.className = 'progress-bar';
+                    usageProgress.setAttribute('role', 'progressbar');
+                    usageProgress.setAttribute('aria-label', (server.server || '服务器') + ' /home 所在文件系统使用率');
+                    usageProgress.setAttribute('aria-valuemin', '0');
+                    usageProgress.setAttribute('aria-valuemax', '100');
+                    usageProgress.setAttribute('aria-valuenow', String(percent));
+                    const usageFill = document.createElement('div');
+                    usageFill.className = 'progress-fill storage';
+                    if (percent >= 90) {
+                        usageFill.classList.add('critical');
+                    } else if (percent >= 75) {
+                        usageFill.classList.add('high');
+                    }
+                    usageFill.style.width = percent + '%';
+                    usageProgress.appendChild(usageFill);
+                    usageBox.appendChild(usageLabel);
+                    usageBox.appendChild(usageValue);
+                    usageBox.appendChild(usageProgress);
+
+                    const spaceBox = document.createElement('div');
+                    spaceBox.className = 'metric-box';
+                    const spaceLabel = document.createElement('div');
+                    spaceLabel.className = 'metric-label';
+                    spaceLabel.textContent = 'Space';
+                    const spaceValue = document.createElement('div');
+                    spaceValue.className = 'metric-value';
+                    spaceValue.textContent = formatBytes(filesystem.used)
+                        + '/' + formatBytes(filesystem.total);
+                    const availableText = document.createElement('div');
+                    availableText.className = 'storage-available';
+                    availableText.textContent = formatBytes(filesystem.available) + ' available';
+                    spaceBox.appendChild(spaceLabel);
+                    spaceBox.appendChild(spaceValue);
+                    spaceBox.appendChild(availableText);
+
+                    metrics.appendChild(usageBox);
+                    metrics.appendChild(spaceBox);
+                    card.appendChild(metrics);
+
+                    const detailMeta = document.createElement('div');
+                    detailMeta.className = 'storage-detail-meta';
+                    const sampledAt = document.createElement('span');
+                    sampledAt.textContent = 'Sample ' + formatSampleTime(server.updated_at);
+                    const filterMeta = document.createElement('span');
+                    const filteredCount = toStorageBytes(server.filtered_user_count) || 0;
+                    filterMeta.textContent = formatStorageThreshold(server.user_min_bytes)
+                        + (filteredCount ? ' · 已过滤 ' + filteredCount : '');
+                    detailMeta.appendChild(sampledAt);
+                    detailMeta.appendChild(filterMeta);
+                    card.appendChild(detailMeta);
+                }
+
+                const errorText = storageStatus.waiting
+                    ? null
+                    : (server.error || (server.stale && server.last_error));
+                if (errorText) {
+                    const error = document.createElement('div');
+                    error.className = server.error
+                        ? 'storage-card-alert error'
+                        : 'storage-card-alert';
+                    error.textContent = server.stale && !server.error
+                        ? '显示上次成功采样：' + errorText
+                        : errorText;
+                    card.appendChild(error);
+                }
+
+                if (storageFetchError && cachedServer) {
+                    const refreshWarning = document.createElement('div');
+                    refreshWarning.className = 'storage-card-alert';
+                    refreshWarning.textContent = '存储信息刷新失败，继续显示上次获取的数据';
+                    card.appendChild(refreshWarning);
+                }
+
+                if (server.partial) {
+                    const warning = document.createElement('div');
+                    warning.className = 'storage-card-alert';
+                    const errorCount = Number(server.user_error_count) || 0;
+                    warning.textContent = errorCount > 0
+                        ? '部分用户目录无法读取：' + errorCount + ' 个'
+                        : '用户目录数据仅部分可用';
+                    card.appendChild(warning);
+                }
+
+                if (storageStatus.waiting) {
+                    const loading = document.createElement('div');
+                    loading.className = 'storage-card-state';
+                    loading.textContent = '等待首次存储采样...';
+                    card.appendChild(loading);
+                } else if (!filesystem) {
+                    const unavailable = document.createElement('div');
+                    unavailable.className = 'storage-card-state';
+                    unavailable.textContent = '暂无可用容量数据';
+                    card.appendChild(unavailable);
+                }
+
+                if (filesystem) {
+                    renderStorageUsers(card, server, scrollSnapshot);
+                }
+                return card;
         }
 
         async function refreshAccessMatrix() {
@@ -1760,9 +2579,34 @@
         function render(data) {
             let online = 0, totalGpus = 0, totalProcs = 0;
             const serversDiv = document.getElementById('servers');
+            const serverData = Array.isArray(data) ? [...data] : [];
+            const knownServerNames = new Set(
+                serverData.map(server => server && server.server).filter(Boolean)
+            );
+            storageByServer.forEach((storageServer, serverName) => {
+                if (!knownServerNames.has(serverName)) {
+                    serverData.push({
+                        server: serverName,
+                        gpus: [],
+                        error: 'GPU 信息暂不可用',
+                        updated_at: null,
+                        stale: false,
+                        last_error: null
+                    });
+                }
+            });
+            const focusedKey = document.activeElement
+                && document.activeElement.dataset
+                ? document.activeElement.dataset.focusKey
+                : null;
+            const storageScrollSnapshot = new Map();
+            serversDiv.querySelectorAll('.storage-user-list[data-focus-key]').forEach(list => {
+                storageScrollSnapshot.set(list.dataset.focusKey, list.scrollTop);
+                storageScrollState.set(list.dataset.focusKey, list.scrollTop);
+            });
             serversDiv.innerHTML = '';
             
-            if (!data || data.length === 0) {
+            if (serverData.length === 0) {
                 const errorDiv = document.createElement('div');
                 errorDiv.className = 'error';
                 errorDiv.textContent = 'No servers';
@@ -1770,30 +2614,32 @@
                 return;
             }
             
-            data.forEach(s => {
+            serverData.forEach(s => {
                 const serverCard = document.createElement('details');
-                serverCard.className = 'server-card';
+                serverCard.className = 'server-card monitor-card';
                 const serverKey = 'server:' + s.server;
                 serverCard.open = getSavedOpenState(serverKey, false);
                 rememberOpenState(serverCard, serverKey);
                 const serverSummary = document.createElement('summary');
                 
                 const serverHeader = document.createElement('div');
-                serverHeader.className = 'server-header';
+                serverHeader.className = 'server-header monitor-card-header';
                 
                 const serverInfo = document.createElement('div');
                 const serverName = document.createElement('div');
                 serverName.className = 'server-name';
                 serverName.textContent = s.server;
                 serverInfo.appendChild(serverName);
+                const gpuList = document.createElement('div');
+                gpuList.className = 'gpu-list';
                 
                 if (s.error) {
                     const status = document.createElement('span');
                     status.className = 'status offline';
-                    status.textContent = 'Offline';
+                    status.textContent = 'GPU Offline';
                     serverHeader.appendChild(serverInfo);
                     const serverMeta = document.createElement('div');
-                    serverMeta.className = 'server-summary-meta';
+                    serverMeta.className = 'server-summary-meta monitor-card-meta';
                     const caret = createCaret();
                     serverMeta.appendChild(status);
                     serverMeta.appendChild(caret);
@@ -1824,7 +2670,7 @@
                     }
                     serverHeader.appendChild(serverInfo);
                     const serverMeta = document.createElement('div');
-                    serverMeta.className = 'server-summary-meta';
+                    serverMeta.className = 'server-summary-meta monitor-card-meta';
                     const gpuCount = s.gpus ? s.gpus.length : 0;
                     const procCount = sumProcesses(s.gpus);
                     const serverCount = document.createElement('span');
@@ -1847,9 +2693,6 @@
                         staleWarning.textContent = 'Showing last successful sample (' + updatedAt + '): ' + (s.last_error || 'latest refresh failed');
                         serverCard.appendChild(staleWarning);
                     }
-                    
-                    const gpuList = document.createElement('div');
-                    gpuList.className = 'gpu-list';
                     
                     if (s.gpus) {
                         totalGpus += s.gpus.length;
@@ -1964,15 +2807,32 @@
                         });
                     }
                     
-                    serverCard.appendChild(gpuList);
                 }
+
+                gpuList.appendChild(
+                    renderServerStorage(s.server, storageScrollSnapshot)
+                );
+                serverCard.appendChild(gpuList);
                 
                 serversDiv.appendChild(serverCard);
             });
+
+            serversDiv.querySelectorAll('.storage-user-list[data-restore-scroll-top]').forEach(list => {
+                list.scrollTop = Number(list.dataset.restoreScrollTop) || 0;
+                delete list.dataset.restoreScrollTop;
+            });
             
-            document.getElementById('total-servers').textContent = online + '/' + data.length;
+            document.getElementById('total-servers').textContent = online + '/' + serverData.length;
             document.getElementById('total-gpus').textContent = totalGpus;
             document.getElementById('total-processes').textContent = totalProcs;
+            if (focusedKey) {
+                const focusTarget = Array.from(
+                    serversDiv.querySelectorAll('[data-focus-key]')
+                ).find(element => element.dataset.focusKey === focusedKey);
+                if (focusTarget) {
+                    focusTarget.focus({preventScroll: true});
+                }
+            }
         }
         
         init();
