@@ -27,11 +27,14 @@ cp config.example.json config.json
 
 常用可选项：
 
+- `monitoring.refresh_interval_seconds`：GPU 采样与页面更新周期；示例为 2 秒。
 - `monitoring.storage_refresh_interval_seconds`：存储采集周期，默认 300 秒。
 - `monitoring.storage_user_min_size_mb`：用户目录显示阈值，默认 100 MiB。
 - `monitoring.collector_mode`：GPU 采集模式，默认 `stream`。
 - `ssh`：全局 SSH 超时和重试覆盖；也可在单台服务器的 `ssh` 中覆盖。
 - `servers[].accept_unknown_host`：是否接受未知主机密钥，默认 `false`。
+
+页面直接按 GPU 采样周期读取最新状态，不再单独配置缓存轮询周期。
 
 `config.json` 和 `user.txt` 包含本地运行数据，均不应提交到版本库。
 

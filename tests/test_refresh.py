@@ -48,8 +48,7 @@ class MonitoringSettingsTests(unittest.TestCase):
             set(example["monitoring"]),
             {
                 "refresh_interval_seconds",
-                "api_poll_interval_seconds",
-                "storage_user_min_size_mb",
+                "storage_refresh_interval_seconds",
             },
         )
         self.assertNotIn("ssh", example)
@@ -58,21 +57,20 @@ class MonitoringSettingsTests(unittest.TestCase):
             {"name", "host", "port", "username", "key_file"},
         )
 
-    def test_two_second_sample_and_api_intervals_are_accepted(self):
+    def test_two_second_sample_interval_is_accepted(self):
         with patch.object(
             config,
             "load_config",
             return_value={
                 "monitoring": {
                     "refresh_interval_seconds": 2,
-                    "api_poll_interval_seconds": 2,
                 }
             },
         ):
             settings = config.get_monitoring_settings()
 
         self.assertEqual(settings["refresh_interval"], 2)
-        self.assertEqual(settings["api_poll_interval"], 2)
+        self.assertNotIn("api_poll_interval", settings)
         self.assertEqual(settings["storage_refresh_interval"], 300)
         self.assertEqual(settings["storage_user_min_size_mb"], 100)
 

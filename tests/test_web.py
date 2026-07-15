@@ -55,10 +55,12 @@ class WebRouteTests(unittest.TestCase):
             "storageScrollState",
             "server.user_min_bytes",
             "server.filtered_user_count",
+            "setInterval(refresh, refreshInterval * 1000)",
             "setInterval(refreshStorage, 60000)",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, html)
+        self.assertNotIn("apiPollInterval", html)
         self.assertNotIn("scrollbar-gutter: stable", html)
 
     def test_gpu_endpoint_returns_state_snapshot(self):
@@ -117,7 +119,6 @@ class WebRouteTests(unittest.TestCase):
         ]
         settings = {
             "refresh_interval": 2,
-            "api_poll_interval": 3,
         }
         with (
             patch.object(web, "get_configured_servers", return_value=servers),
@@ -129,11 +130,10 @@ class WebRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             set(payload),
-            {"servers", "refresh_interval", "poll_interval"},
+            {"servers", "refresh_interval"},
         )
         self.assertEqual(payload["servers"], [{"name": "alpha"}])
         self.assertEqual(payload["refresh_interval"], 2)
-        self.assertEqual(payload["poll_interval"], 3)
         self.assertNotIn("host", payload["servers"][0])
         self.assertNotIn("username", payload["servers"][0])
         self.assertNotIn("key_file", payload["servers"][0])

@@ -59,7 +59,6 @@ def get_servers():
         {
             "servers": servers,
             "refresh_interval": settings["refresh_interval"],
-            "poll_interval": settings["api_poll_interval"],
         }
     )
 

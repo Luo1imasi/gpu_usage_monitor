@@ -1108,7 +1108,7 @@
                 </div>
                 <div class="monitor-heading-meta">
                     <span class="monitor-update">采样：<span id="last-update">-</span></span>
-                    <span class="monitor-update">刷新：<span id="interval">-</span>s</span>
+                    <span class="monitor-update">周期：<span id="interval">-</span>s</span>
                 </div>
             </div>
             <div class="servers monitor-grid" id="servers">Loading...</div>
@@ -1202,7 +1202,6 @@
     
     <script>
         let refreshInterval = 2;
-        let apiPollInterval = 2;
         let configuredServers = [];
         let latestAccessMatrix = null;
         let latestDetectedUserItems = [];
@@ -1373,7 +1372,6 @@
                 const r = await fetch('/api/servers');
                 const cfg = await r.json();
                 refreshInterval = cfg.refresh_interval || 2;
-                apiPollInterval = cfg.poll_interval || 2;
                 renderAccessServerFilter(cfg.servers || []);
                 document.getElementById('interval').textContent = refreshInterval;
             } catch(e) {
@@ -1382,7 +1380,7 @@
             }
             
             await Promise.all([refresh(), refreshStorage()]);
-            setInterval(refresh, apiPollInterval * 1000);
+            setInterval(refresh, refreshInterval * 1000);
             setInterval(refreshStorage, 60000);
         }
         

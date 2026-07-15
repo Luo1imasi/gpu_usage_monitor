@@ -28,7 +28,6 @@ GPU_COLLECTOR_RETRY_BACKOFF_MAX_SECONDS = 60
 GPU_MAX_WORKERS = 8
 STORAGE_REFRESH_INTERVAL_SECONDS = 300
 STORAGE_USER_MIN_SIZE_MB = 100
-API_POLL_INTERVAL_SECONDS = 5
 
 _config_cache = None
 _config_signature = None
@@ -191,13 +190,6 @@ def get_monitoring_settings():
             SSH_OPERATION_TIMEOUT,
             5,
             900,
-        ),
-        "api_poll_interval": get_bounded_number(
-            settings,
-            "api_poll_interval_seconds",
-            API_POLL_INTERVAL_SECONDS,
-            1,
-            60,
         ),
         "storage_refresh_interval": get_bounded_number(
             settings,

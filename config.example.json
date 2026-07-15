@@ -2,8 +2,7 @@
   "admin_token": "change-me",
   "monitoring": {
     "refresh_interval_seconds": 2,
-    "api_poll_interval_seconds": 2,
-    "storage_user_min_size_mb": 100
+    "storage_refresh_interval_seconds": 300
   },
   "servers": [
     {
