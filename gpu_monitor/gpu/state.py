@@ -69,7 +69,7 @@ class GPUStateStore:
         current_identities = {
             server["name"]: get_gpu_cache_identity(server) for server in servers
         }
-        ordered_names = sorted(current_identities)
+        ordered_names = list(current_identities)
         with self.lock:
             existing = {item["server"]: item for item in self.cached_data}
             self.cached_data = [
@@ -82,7 +82,7 @@ class GPUStateStore:
 
     def publish_gpu_result(self, result, server_names):
         server_name = result["server"]
-        ordered_names = sorted(server_names)
+        ordered_names = list(server_names)
         now = time.time()
 
         with self.lock:

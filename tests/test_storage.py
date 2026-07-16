@@ -157,6 +157,37 @@ class StorageCommandTests(unittest.TestCase):
 
 
 class StorageStateTests(unittest.TestCase):
+    def test_server_names_preserve_configured_order(self):
+        names = [
+            "roboparty-H20-1",
+            "roboparty-H200-1",
+            "roboparty-4090-4",
+            "roboparty-4090-5",
+            "roboparty-4090-8",
+            "roboparty-4090-48-1",
+            "roboparty-4090-48-2",
+        ]
+        state = storage.StorageStateStore()
+
+        state.initialize_storage_cache([{"name": name} for name in names])
+        self.assertEqual(
+            [item["server"] for item in state.get_cached_data()],
+            names,
+        )
+
+        state.publish_storage_result(
+            {
+                "server": "roboparty-4090-5",
+                **storage_payload(),
+                "error": None,
+            },
+            names,
+        )
+        self.assertEqual(
+            [item["server"] for item in state.get_cached_data()],
+            names,
+        )
+
     def test_failure_preserves_last_success_as_stale(self):
         success = {
             "server": "alpha",

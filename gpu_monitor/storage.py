@@ -207,7 +207,7 @@ class StorageStateStore:
         identities = {
             server["name"]: get_storage_cache_identity(server) for server in servers
         }
-        ordered_names = sorted(identities)
+        ordered_names = list(identities)
         with self.lock:
             existing = {item["server"]: item for item in self.cached_data}
             self.cached_data = [
@@ -223,7 +223,7 @@ class StorageStateStore:
 
     def publish_storage_result(self, result, server_names):
         server_name = result["server"]
-        ordered_names = sorted(server_names)
+        ordered_names = list(server_names)
         user_min_bytes = result.get("user_min_bytes")
         if user_min_bytes is None:
             user_min_bytes = get_storage_user_min_bytes()

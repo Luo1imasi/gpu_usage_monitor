@@ -332,6 +332,34 @@ class GPUCacheTests(unittest.TestCase):
             self.state_store.cached_data[1]["error"], "Waiting for first sample"
         )
 
+    def test_server_names_preserve_configured_order(self):
+        names = [
+            "roboparty-H20-1",
+            "roboparty-H200-1",
+            "roboparty-4090-4",
+            "roboparty-4090-5",
+            "roboparty-4090-8",
+            "roboparty-4090-48-1",
+            "roboparty-4090-48-2",
+        ]
+
+        self.state_store.initialize_gpu_cache(
+            [{"name": name} for name in names]
+        )
+        self.assertEqual(
+            [item["server"] for item in self.state_store.cached_data],
+            names,
+        )
+
+        self.state_store.publish_gpu_result(
+            gpu_result("roboparty-4090-5", "updated"),
+            names,
+        )
+        self.assertEqual(
+            [item["server"] for item in self.state_store.cached_data],
+            names,
+        )
+
     def test_identity_change_discards_another_server_last_success(self):
         old_server = {
             "name": "alpha",
