@@ -583,6 +583,126 @@
             color: #f14c4c;
         }
 
+        .key-delete-dialog {
+            width: min(620px, calc(100vw - 32px));
+            max-height: min(720px, calc(100vh - 32px));
+            margin: auto;
+            padding: 0;
+            overflow: hidden;
+            color: #cccccc;
+            background: #252526;
+            border: 1px solid #4a4a4a;
+            border-radius: 8px;
+            box-shadow: 0 18px 54px rgba(0, 0, 0, 0.5);
+        }
+
+        .key-delete-dialog::backdrop {
+            background: rgba(0, 0, 0, 0.68);
+        }
+
+        .key-delete-dialog-header {
+            padding: 16px 18px 12px;
+            border-bottom: 1px solid #3c3c3c;
+        }
+
+        .key-delete-dialog-title {
+            color: #fff;
+            font-size: 1em;
+            font-weight: 500;
+        }
+
+        .key-delete-dialog-description {
+            margin-top: 5px;
+            color: #a8a8a8;
+            font-size: 0.8em;
+            line-height: 1.45;
+        }
+
+        .key-delete-list {
+            max-height: min(430px, calc(100vh - 250px));
+            margin: 14px 18px;
+            overflow: auto;
+            border: 1px solid #3c3c3c;
+            border-radius: 5px;
+        }
+
+        .key-delete-option {
+            display: grid;
+            grid-template-columns: auto minmax(0, 1fr);
+            gap: 10px;
+            align-items: start;
+            padding: 11px 12px;
+            border-bottom: 1px solid #3c3c3c;
+            cursor: pointer;
+        }
+
+        .key-delete-option:last-child {
+            border-bottom: 0;
+        }
+
+        .key-delete-option:hover {
+            background: rgba(255, 255, 255, 0.035);
+        }
+
+        .key-delete-option input {
+            margin-top: 3px;
+        }
+
+        .key-delete-option-main,
+        .key-delete-option-meta {
+            display: block;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .key-delete-option-main {
+            color: #dcdcaa;
+            font-size: 0.82em;
+        }
+
+        .key-delete-option-meta {
+            margin-top: 3px;
+            color: #858585;
+            font-family: monospace;
+            font-size: 0.72em;
+        }
+
+        .key-delete-dialog-result {
+            min-height: 18px;
+            margin: 0 18px 10px;
+            font-size: 0.78em;
+        }
+
+        .key-delete-dialog-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            padding: 12px 18px 16px;
+            border-top: 1px solid #3c3c3c;
+        }
+
+        .key-delete-dialog-actions button {
+            padding: 7px 12px;
+            color: #fff;
+            background: #3c3c3c;
+            border: 1px solid #555;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        .key-delete-dialog-actions .access-danger {
+            background: #7f1d1d;
+            border-color: #991b1b;
+        }
+
+        .key-delete-dialog-actions button:disabled {
+            color: #858585;
+            background: #3c3c3c;
+            border-color: #4a4a4a;
+            cursor: not-allowed;
+        }
+
         .gpu-item.storage-item {
             grid-column: 1 / -1;
             min-width: 0;
@@ -1199,6 +1319,19 @@
             </div>
         </details>
     </div>
+
+    <dialog class="key-delete-dialog" id="key-delete-dialog" aria-labelledby="key-delete-dialog-title">
+        <div class="key-delete-dialog-header">
+            <div class="key-delete-dialog-title" id="key-delete-dialog-title">删除 SSH Key</div>
+            <div class="key-delete-dialog-description" id="key-delete-dialog-description"></div>
+        </div>
+        <div class="key-delete-list" id="key-delete-list"></div>
+        <div class="key-delete-dialog-result" id="key-delete-dialog-result"></div>
+        <div class="key-delete-dialog-actions">
+            <button id="cancel-key-delete" type="button">取消</button>
+            <button class="access-danger" id="confirm-key-delete" type="button" disabled>删除选中 Key</button>
+        </div>
+    </dialog>
     
     <script>
         let refreshInterval = 2;
@@ -1213,6 +1346,7 @@
         let adminToken = '';
         let adminTokenPromptDismissed = false;
         let hasStorageData = false;
+        let pendingKeyDeletion = null;
         const collapseState = new Map();
         const storageScrollState = new Map();
         
@@ -1353,6 +1487,16 @@
             document.getElementById('add-user').addEventListener('click', addUserWithToken);
             document.getElementById('detect-users').addEventListener('click', detectServerUsers);
             document.getElementById('import-detected-users').addEventListener('click', importDetectedUsers);
+            document.getElementById('cancel-key-delete').addEventListener('click', closeDeleteKeyDialog);
+            document.getElementById('confirm-key-delete').addEventListener('click', confirmDeleteSelectedKeys);
+            document.getElementById('key-delete-dialog').addEventListener('close', () => {
+                pendingKeyDeletion = null;
+            });
+            document.getElementById('key-delete-dialog').addEventListener('cancel', event => {
+                if (pendingKeyDeletion && pendingKeyDeletion.busy) {
+                    event.preventDefault();
+                }
+            });
             document.getElementById('ssh-key-input').addEventListener('keydown', event => {
                 if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
                     event.preventDefault();
@@ -1881,7 +2025,6 @@
 
             const users = data && data.users ? data.users : [];
             const servers = data && data.servers ? data.servers : [];
-            const partialMatrix = Boolean(data && data.scope && data.scope.partial);
             metaDiv.textContent = getAccessMatrixMetaText(data);
 
             if (users.length === 0 || servers.length === 0) {
@@ -1919,20 +2062,16 @@
                 const deleteButton = document.createElement('button');
                 deleteButton.type = 'button';
                 deleteButton.className = 'user-row-action access-danger';
-                deleteButton.textContent = '撤权';
-                deleteButton.disabled = partialMatrix;
-                if (partialMatrix) {
-                    deleteButton.title = '按需矩阵中不可执行全局撤权';
-                }
-                deleteButton.addEventListener('click', () => revokeUserAccess(user.username));
+                deleteButton.textContent = '删 Key';
+                deleteButton.title = '选择要从全部配置服务器删除的 SSH Key';
+                deleteButton.addEventListener('click', event => {
+                    openDeleteKeyDialog(user.username, event.currentTarget);
+                });
                 const deleteAccountButton = document.createElement('button');
                 deleteAccountButton.type = 'button';
                 deleteAccountButton.className = 'user-row-action access-danger';
                 deleteAccountButton.textContent = '删账号';
-                deleteAccountButton.disabled = partialMatrix;
-                if (partialMatrix) {
-                    deleteAccountButton.title = '按需矩阵中不可执行全局删除';
-                }
+                deleteAccountButton.title = '从全部配置服务器删除账号和 home 目录';
                 deleteAccountButton.addEventListener('click', () => deleteUserAccount(user.username));
                 userCell.appendChild(userLabel);
                 userCell.appendChild(deleteButton);
@@ -1947,7 +2086,14 @@
                     checkbox.className = 'access-pair-select';
                     checkbox.dataset.user = user.username;
                     checkbox.dataset.server = status.server;
-                    checkbox.disabled = Boolean(status.error || status.accessible);
+                    const allKeysInstalled = status.all_keys_installed === true;
+                    const expectedKeyCount = Number.isFinite(Number(status.expected_key_count))
+                        ? Number(status.expected_key_count)
+                        : Number(user.key_count) || 0;
+                    const installedKeyCount = Number.isFinite(Number(status.installed_key_count))
+                        ? Number(status.installed_key_count)
+                        : Number(status.matching_key_count) || 0;
+                    checkbox.disabled = Boolean(status.error || allKeysInstalled);
                     label.appendChild(checkbox);
                     label.appendChild(document.createTextNode(' '));
                     const statusText = document.createElement('span');
@@ -1955,9 +2101,13 @@
                         cell.className = 'access-error';
                         statusText.textContent = '错误';
                         cell.title = status.error;
-                    } else if (status.accessible) {
+                    } else if (allKeysInstalled) {
                         cell.className = 'access-ok';
-                        statusText.textContent = '已开通';
+                        statusText.textContent = 'Key已同步';
+                    } else if (status.accessible) {
+                        cell.className = 'access-missing';
+                        statusText.textContent = '部分Key ' + installedKeyCount + '/' + expectedKeyCount;
+                        cell.title = '仍有 ' + (Number(status.missing_key_count) || Math.max(expectedKeyCount - installedKeyCount, 0)) + ' 把 Key 未同步';
                     } else if (status.user_exists) {
                         cell.className = 'access-missing';
                         statusText.textContent = status.key_installed === false ? '缺少Key' : '不可确认';
@@ -2059,7 +2209,7 @@
             const missingPairs = new Set();
             latestAccessMatrix.users.forEach(user => {
                 (user.servers || []).forEach(status => {
-                    if (!status.accessible && !status.error) {
+                    if (status.all_keys_installed !== true && !status.error) {
                         missingPairs.add(user.username + '\u0000' + status.server);
                     }
                 });
@@ -2140,7 +2290,7 @@
             const accountText = deletedAccounts > 0 ? '，删除账号 ' + deletedAccounts + ' 个' : '';
             const groupText = removedGroups > 0 ? '，删除组 ' + removedGroups + ' 个' : '';
             const processText = processCount > 0 ? '，终止进程 ' + processCount + ' 个' : '';
-            return '完成 ' + serverCount + ' 台服务器撤权，远端移除 ' + removedKeys + ' 个 Key' + accountText + groupText + processText + '，' + localText + '，错误 ' + errorCount + ' 个';
+            return '完成 ' + serverCount + ' 台服务器删除操作，远端移除 ' + removedKeys + ' 个 Key' + accountText + groupText + processText + '，' + localText + '，错误 ' + errorCount + ' 个';
         }
 
         function collectDeleteErrors(data) {
@@ -2450,62 +2600,239 @@
             }
         }
 
-        async function revokeUserAccess(username) {
-            if (!latestAccessMatrix || !latestAccessMatrix.users) {
-                setAccessResult('暂无权限矩阵数据', true);
-                return;
-            }
+        function getDeleteKeyLabel(key) {
+            const keyParts = String(key.ssh_key || '').trim().split(/\s+/);
+            const keyType = key.key_type || keyParts[0] || 'SSH Key';
+            const comment = key.comment || keyParts.slice(2).join(' ');
+            const keyId = String(key.key_id || '');
+            const shortKeyId = keyId.length > 28
+                ? keyId.slice(0, 17) + '…' + keyId.slice(-8)
+                : keyId;
+            return {
+                main: comment || keyType,
+                meta: keyType + (shortKeyId ? ' · ' + shortKeyId : '')
+            };
+        }
 
-            const user = latestAccessMatrix.users.find(item => item.username === username);
-            if (!user) {
-                setAccessResult('用户不存在于当前矩阵', true);
-                return;
-            }
+        function setDeleteKeyDialogResult(message, isError) {
+            const result = document.getElementById('key-delete-dialog-result');
+            result.textContent = message || '';
+            result.className = isError
+                ? 'key-delete-dialog-result access-error'
+                : 'key-delete-dialog-result';
+        }
 
-            const targetServers = (user.servers || []).filter(status => {
-                return !status.error && (status.accessible || status.user_exists);
-            }).map(status => status.server);
-            const mode = targetServers.length > 0 ? 'revoke' : 'local_only';
-            const confirmText = window.prompt('撤权会删除本地 user.txt 记录，并在相关服务器清空该用户 SSH Key。请输入用户名确认：' + username);
-            if (confirmText !== username) {
-                setAccessResult('已取消撤权：用户名确认不匹配', true);
-                return;
+        function getSelectedDeleteKeys() {
+            if (!pendingKeyDeletion) {
+                return [];
             }
+            return Array.from(document.querySelectorAll('.key-delete-select:checked')).map(input => {
+                return pendingKeyDeletion.keys[Number(input.dataset.index)];
+            }).filter(Boolean);
+        }
 
-            const token = requestAdminToken('请输入管理 Token 确认撤权');
+        function updateDeleteKeySelection() {
+            const selectedCount = getSelectedDeleteKeys().length;
+            const totalCount = pendingKeyDeletion ? pendingKeyDeletion.keys.length : 0;
+            const confirmButton = document.getElementById('confirm-key-delete');
+            confirmButton.disabled = Boolean(!selectedCount || (pendingKeyDeletion && pendingKeyDeletion.busy));
+            setDeleteKeyDialogResult('已选择 ' + selectedCount + '/' + totalCount + ' 把 Key', false);
+        }
+
+        function renderDeleteKeyDialog(username, keys) {
+            const dialog = document.getElementById('key-delete-dialog');
+            const description = document.getElementById('key-delete-dialog-description');
+            const list = document.getElementById('key-delete-list');
+            description.textContent = '用户 ' + username + '：选择一把或多把 Key。确认后会从全部配置服务器和本地用户配置中删除。';
+            list.innerHTML = '';
+
+            keys.forEach((key, index) => {
+                const labelText = getDeleteKeyLabel(key);
+                const option = document.createElement('label');
+                option.className = 'key-delete-option';
+                option.title = key.ssh_key || key.key_id || '';
+
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.className = 'key-delete-select';
+                checkbox.dataset.index = index;
+                checkbox.addEventListener('change', updateDeleteKeySelection);
+
+                const content = document.createElement('span');
+                const main = document.createElement('span');
+                main.className = 'key-delete-option-main';
+                main.textContent = labelText.main;
+                const meta = document.createElement('span');
+                meta.className = 'key-delete-option-meta';
+                meta.textContent = labelText.meta;
+                content.appendChild(main);
+                content.appendChild(meta);
+                option.appendChild(checkbox);
+                option.appendChild(content);
+                list.appendChild(option);
+            });
+
+            document.getElementById('cancel-key-delete').disabled = false;
+            updateDeleteKeySelection();
+            if (!dialog.open) {
+                dialog.showModal();
+            }
+        }
+
+        function closeDeleteKeyDialog() {
+            const dialog = document.getElementById('key-delete-dialog');
+            if (dialog.open) {
+                dialog.close();
+            } else {
+                pendingKeyDeletion = null;
+            }
+        }
+
+        function setDeleteKeyDialogBusy(isBusy, preserveResult) {
+            if (pendingKeyDeletion) {
+                pendingKeyDeletion.busy = isBusy;
+            }
+            document.querySelectorAll('.key-delete-select').forEach(input => {
+                input.disabled = isBusy;
+            });
+            document.getElementById('cancel-key-delete').disabled = isBusy;
+            if (isBusy) {
+                document.getElementById('confirm-key-delete').disabled = true;
+            } else if (!preserveResult) {
+                updateDeleteKeySelection();
+            } else {
+                const selectedCount = getSelectedDeleteKeys().length;
+                document.getElementById('confirm-key-delete').disabled = selectedCount === 0;
+            }
+        }
+
+        async function openDeleteKeyDialog(username, triggerButton) {
+            const token = getAdminToken('请输入管理 Token 获取 ' + username + ' 的 Key 列表', true);
             if (!token) {
-                setAccessResult('已取消撤权：缺少管理 Token', true);
+                setAccessResult('已取消删 Key：缺少管理 Token', true);
                 return;
             }
 
-            setAccessResult('正在撤权，请稍候...', false);
+            if (triggerButton) {
+                triggerButton.disabled = true;
+            }
+            setAccessResult('正在获取 ' + username + ' 的 Key 列表...', false);
 
             try {
-                const response = await fetch('/api/users/' + encodeURIComponent(username), {
-                    method: 'DELETE',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-Admin-Token': token
-                    },
-                    body: JSON.stringify({
-                        mode: mode,
-                        servers: targetServers,
-                        remove_from_user_file: true,
-                        clear_authorized_keys: true
-                    })
+                const response = await fetch('/api/users/' + encodeURIComponent(username) + '/keys', {
+                    headers: {'X-Admin-Token': token}
                 });
-                const data = await response.json();
+                const data = await response.json().catch(() => ({}));
                 if (response.status === 403) {
                     resetAdminToken();
                 }
                 if (!response.ok || data.error) {
-                    setAccessResult('撤权失败: ' + (data.error || response.status), true);
+                    setAccessResult('获取 Key 列表失败: ' + (data.error || response.status), true);
                     return;
                 }
-                setAccessResult(summarizeDeleteResults(data), false, collectDeleteErrors(data));
+
+                const keys = Array.isArray(data.keys)
+                    ? data.keys.filter(key => key && key.key_id !== undefined && key.key_id !== null)
+                    : [];
+                if (keys.length === 0) {
+                    setAccessResult('用户 ' + username + ' 没有可删除的 Key', true);
+                    return;
+                }
+
+                pendingKeyDeletion = {
+                    username: data.username || username,
+                    token: token,
+                    keys: keys,
+                    busy: false
+                };
+                renderDeleteKeyDialog(pendingKeyDeletion.username, keys);
+                setAccessResult('已获取 ' + keys.length + ' 把 Key，请选择要删除的项', false);
+            } catch(e) {
+                setAccessResult('获取 Key 列表请求失败', true);
+            } finally {
+                if (triggerButton && triggerButton.isConnected) {
+                    triggerButton.disabled = false;
+                }
+            }
+        }
+
+        function summarizeDeleteKeyResults(data, fallbackRequestedCount) {
+            const results = data && Array.isArray(data.results) ? data.results : [];
+            const selectedKeys = data && (data.selected_key_ids || data.selected_keys);
+            const requestedValue = data && data.requested_key_count;
+            const requestedCount = Number.isFinite(Number(requestedValue))
+                ? Number(requestedValue)
+                : (Array.isArray(selectedKeys) ? selectedKeys.length : fallbackRequestedCount);
+            const remoteRemoved = results.reduce((total, server) => {
+                return total + Number(server && server.result && server.result.keys_removed || 0);
+            }, 0);
+            const local = data && data.local ? data.local : {};
+            const localRemoved = Array.isArray(local.removed_keys)
+                ? local.removed_keys.length
+                : Number(local.removed_keys !== undefined ? local.removed_keys : local.removed_lines) || 0;
+            const localText = local.skipped
+                ? '本地 Key 保留' + (local.reason ? '（' + local.reason + '）' : '')
+                : '本地移除 ' + localRemoved + ' 把 Key';
+            return '请求删除 ' + requestedCount + ' 把 Key；' + results.length + ' 台服务器共移除 ' + remoteRemoved + ' 条，' + localText;
+        }
+
+        async function confirmDeleteSelectedKeys() {
+            const deletion = pendingKeyDeletion;
+            const selectedKeys = getSelectedDeleteKeys();
+            if (!deletion || selectedKeys.length === 0) {
+                setDeleteKeyDialogResult('请至少选择一把 Key', true);
+                return;
+            }
+
+            if (!window.confirm('确认删除用户 ' + deletion.username + ' 的 ' + selectedKeys.length + ' 把 Key？此操作会作用于全部配置服务器。')) {
+                return;
+            }
+
+            const keyIds = selectedKeys.map(key => key.key_id);
+            setDeleteKeyDialogBusy(true);
+            setDeleteKeyDialogResult('正在从全部配置服务器删除，请稍候...', false);
+
+            try {
+                const response = await fetch('/api/users/' + encodeURIComponent(deletion.username) + '/keys', {
+                    method: 'DELETE',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Admin-Token': deletion.token
+                    },
+                    body: JSON.stringify({key_ids: keyIds})
+                });
+                const data = await response.json().catch(() => ({}));
+                if (response.status === 403) {
+                    resetAdminToken();
+                }
+                if (!response.ok || data.error) {
+                    const message = '删 Key 失败: ' + (data.error || response.status);
+                    if (response.status === 403) {
+                        closeDeleteKeyDialog();
+                    } else {
+                        setDeleteKeyDialogResult(message, true);
+                    }
+                    setAccessResult(message, true);
+                    return;
+                }
+
+                const details = collectDeleteErrors(data);
+                if (data.local && data.local.skipped && data.local.reason) {
+                    details.push('本地 Key 保留: ' + data.local.reason);
+                }
+                const hasErrors = details.length > 0 || Boolean(data.local && data.local.skipped);
+                const summary = summarizeDeleteKeyResults(data, keyIds.length);
+                closeDeleteKeyDialog();
+                setAccessResult(summary, hasErrors, details);
                 markAccessMatrixStale();
             } catch(e) {
-                setAccessResult('撤权请求失败', true);
+                const message = '删 Key 请求失败';
+                setDeleteKeyDialogResult(message, true);
+                setAccessResult(message, true);
+            } finally {
+                if (pendingKeyDeletion === deletion) {
+                    setDeleteKeyDialogBusy(false, true);
+                }
             }
         }
 
@@ -2515,21 +2842,12 @@
                 return;
             }
 
-            const user = latestAccessMatrix.users.find(item => item.username === username);
-            if (!user) {
+            if (!latestAccessMatrix.users.some(item => item.username === username)) {
                 setAccessResult('用户不存在于当前矩阵', true);
                 return;
             }
 
-            const targetServers = (user.servers || []).filter(status => {
-                return !status.error && (status.accessible || status.user_exists);
-            }).map(status => status.server);
-            if (targetServers.length === 0) {
-                setAccessResult('没有可删除账号的服务器；如只需删除本地记录，请使用撤权', true);
-                return;
-            }
-
-            const confirmText = window.prompt('将终止该用户进程，并删除远端账号和 home 目录。请输入用户名确认：' + username);
+            const confirmText = window.prompt('将尝试在全部配置服务器终止该用户进程，并删除账号和 home 目录；任一服务器失败都会保留本地记录。请输入用户名确认：' + username);
             if (confirmText !== username) {
                 setAccessResult('已取消删除账号：用户名确认不匹配', true);
                 return;
@@ -2552,7 +2870,6 @@
                     },
                     body: JSON.stringify({
                         mode: 'delete_account',
-                        servers: targetServers,
                         confirm: username,
                         remove_home: true,
                         remove_from_user_file: true,
@@ -2567,7 +2884,12 @@
                     setAccessResult('删除账号失败: ' + (data.error || response.status), true);
                     return;
                 }
-                setAccessResult(summarizeDeleteResults(data), false, collectDeleteErrors(data));
+                const details = collectDeleteErrors(data);
+                if (data.local && data.local.skipped && data.local.reason) {
+                    details.push('本地用户记录保留: ' + data.local.reason);
+                }
+                const hasErrors = details.length > 0 || Boolean(data.local && data.local.skipped);
+                setAccessResult(summarizeDeleteResults(data), hasErrors, details);
                 markAccessMatrixStale();
             } catch(e) {
                 setAccessResult('删除账号请求失败', true);

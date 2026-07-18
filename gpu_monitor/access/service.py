@@ -12,6 +12,7 @@ from gpu_monitor.access.remote_commands import (
     build_access_check_command,
     build_configure_users_command,
     build_detect_users_command,
+    build_remove_user_keys_command,
     build_revoke_user_command,
 )
 from gpu_monitor.config import (
@@ -24,10 +25,13 @@ from gpu_monitor.ssh import run_server_ssh_command_status, sanitize_error
 from gpu_monitor.user_store import (
     USER_FILE_PATH,
     annotate_discovered_users,
+    get_user_key_records,
     get_user_store_generation,
     get_users_by_name,
     load_user_keys,
+    remove_user_keys_from_file,
     remove_user_from_file,
+    ssh_key_id,
     validate_username,
 )
 
@@ -38,6 +42,7 @@ ADMIN_MAX_WORKERS = 4
 ACCESS_MATRIX_CACHE_TTL = 30
 ACCESS_MATRIX_CACHE_MAX_ENTRIES = 64
 PROTECTED_USERNAMES = {"root"}
+KEY_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 admin_executor = ThreadPoolExecutor(max_workers=ADMIN_MAX_WORKERS)
 access_matrix_cache = {}
@@ -385,7 +390,187 @@ def remote_user_change_has_errors(results):
     return False
 
 
+def list_user_keys(username):
+    if not validate_username(username):
+        return {"error": "invalid_username", "keys": []}, 400
+
+    keys = get_user_key_records(username)
+    if keys is None:
+        return {"error": "user_not_found", "username": username, "keys": []}, 404
+
+    return {
+        "error": None,
+        "username": username,
+        "key_count": len(keys),
+        "keys": keys,
+    }, 200
+
+
+def remove_user_keys_on_server(server, username, ssh_keys):
+    try:
+        status, out, err = run_server_ssh_command_status(
+            server,
+            build_remove_user_keys_command(username, ssh_keys),
+            timeout=120,
+            total_timeout=240,
+            operation_timeout=360,
+            retry_on_transport=False,
+            operation_name="remove user keys",
+        )
+        if status != 0:
+            message = err.strip() or out.strip() or "remove keys command failed"
+            return {
+                "server": server["name"],
+                "error": sanitize_error(message),
+                "result": {},
+            }
+
+        result = json.loads(out)
+        if not isinstance(result, dict):
+            raise ValueError("invalid remove keys result")
+        return {"server": server["name"], "error": None, "result": result}
+    except Exception as e:
+        logger.error(
+            "Error removing keys for user %s on %s: %s",
+            username,
+            server["name"],
+            e,
+        )
+        return {
+            "server": server["name"],
+            "error": sanitize_error(str(e)),
+            "result": {},
+        }
+
+
+def normalize_key_id_selection(payload):
+    if not isinstance(payload, dict):
+        return None, {"error": "request_body_must_be_an_object"}
+
+    key_ids = payload.get("key_ids")
+    if key_ids is None and "key_id" in payload:
+        key_ids = [payload.get("key_id")]
+    if key_ids is None:
+        return None, {"error": "select_at_least_one_key"}
+    if not isinstance(key_ids, list):
+        return None, {"error": "key_ids_must_be_a_list"}
+    if not key_ids:
+        return None, {"error": "select_at_least_one_key"}
+
+    normalized = []
+    invalid_key_ids = []
+    seen = set()
+    for key_id in key_ids:
+        if not isinstance(key_id, str) or not KEY_ID_PATTERN.fullmatch(key_id):
+            invalid_key_ids.append(key_id)
+            continue
+        normalized_key_id = key_id.lower()
+        if normalized_key_id not in seen:
+            seen.add(normalized_key_id)
+            normalized.append(normalized_key_id)
+
+    if invalid_key_ids:
+        return None, {
+            "error": "invalid_key_ids",
+            "invalid_key_ids": invalid_key_ids,
+        }
+    if not normalized:
+        return None, {"error": "select_at_least_one_key"}
+    return normalized, None
+
+
+def delete_user_keys(username, payload):
+    if not validate_username(username):
+        return {"error": "invalid_username", "results": []}, 400
+    if is_protected_username(username):
+        return {"error": "protected_username", "results": []}, 400
+    if isinstance(payload, dict) and "servers" in payload:
+        return {"error": "server_selection_not_supported", "results": []}, 400
+
+    requested_key_ids, error = normalize_key_id_selection(payload)
+    if error:
+        return {**error, "results": []}, 400
+
+    users_by_name = get_users_by_name()
+    user = users_by_name.get(username)
+    if user is None:
+        return {
+            "error": "user_not_found",
+            "username": username,
+            "results": [],
+        }, 404
+
+    keys_by_id = {}
+    for ssh_key in user.get("ssh_keys", []):
+        keys_by_id.setdefault(ssh_key_id(ssh_key), ssh_key)
+
+    unknown_key_ids = [
+        key_id for key_id in requested_key_ids if key_id not in keys_by_id
+    ]
+    if unknown_key_ids:
+        return {
+            "error": "invalid_key_selection",
+            "unknown_key_ids": unknown_key_ids,
+            "results": [],
+        }, 400
+
+    selected_keys = [keys_by_id[key_id] for key_id in requested_key_ids]
+    selected_servers = get_configured_servers()
+    futures = {
+        admin_executor.submit(
+            remove_user_keys_on_server,
+            server,
+            username,
+            selected_keys,
+        ): server
+        for server in selected_servers
+    }
+    results = []
+    for future in as_completed(futures):
+        server = futures[future]
+        try:
+            results.append(future.result())
+        except Exception as e:
+            logger.error(
+                "Unexpected key removal error for %s: %s", server["name"], e
+            )
+            results.append(
+                {
+                    "server": server["name"],
+                    "error": sanitize_error(str(e)),
+                    "result": {},
+                }
+            )
+
+    results.sort(key=lambda item: item["server"])
+    if remote_user_change_has_errors(results):
+        local_result = {
+            "username": username,
+            "requested_key_count": len(requested_key_ids),
+            "removed_keys": 0,
+            "removed_lines": 0,
+            "removed_key_ids": [],
+            "remaining_key_count": len(keys_by_id),
+            "skipped": True,
+            "reason": "remote_errors",
+        }
+    else:
+        local_result, _ = remove_user_keys_from_file(username, requested_key_ids)
+
+    invalidate_access_matrix_cache()
+    return {
+        "error": None,
+        "username": username,
+        "requested_key_count": len(requested_key_ids),
+        "selected_key_ids": requested_key_ids,
+        "local": local_result,
+        "results": results,
+    }, 200
+
+
 def delete_user_access(username, payload):
+    if not isinstance(payload, dict):
+        return {"error": "request_body_must_be_an_object", "results": []}, 400
     if not validate_username(username):
         return {"error": "invalid_username", "results": []}, 400
     if is_protected_username(username):
@@ -406,11 +591,19 @@ def delete_user_access(username, payload):
             invalidate_access_matrix_cache()
         return {"error": None, "local": local_result, "results": []}, 200
 
-    selected_servers, error = resolve_selected_servers(
-        payload.get("servers"), allow_empty=True
-    )
-    if error:
-        return {**error, "results": []}, 400
+    if mode == "delete_account":
+        # Account deletion is global. Never trust a filtered/stale matrix scope,
+        # otherwise an offline server could retain the account after the local
+        # record has been removed.
+        if "servers" in payload:
+            return {"error": "server_selection_not_supported", "results": []}, 400
+        selected_servers = get_configured_servers()
+    else:
+        selected_servers, error = resolve_selected_servers(
+            payload.get("servers"), allow_empty=True
+        )
+        if error:
+            return {**error, "results": []}, 400
     if not selected_servers:
         return {"error": "select_at_least_one_server", "results": []}, 400
 
@@ -613,7 +806,10 @@ def build_access_matrix(server_names=None, usernames=None):
         "users": [
             {
                 "username": user["username"],
-                "key_count": len(user["key_hashes"]),
+                "key_count": len(
+                    user.get("key_ids")
+                    or {ssh_key_id(key) for key in user.get("ssh_keys", [])}
+                ),
                 "servers": [],
             }
             for user in users
@@ -648,7 +844,11 @@ def build_access_matrix(server_names=None, usernames=None):
         server_results[result["server"]] = result
 
     for user_item, source_user in zip(matrix["users"], users):
-        expected_hashes = set(source_user["key_hashes"])
+        expected_key_ids = set(
+            source_user.get("key_ids")
+            or {ssh_key_id(key) for key in source_user.get("ssh_keys", [])}
+        )
+        expected_key_count = len(expected_key_ids)
         for server in servers:
             server_name = server["name"]
             server_result = server_results.get(
@@ -657,20 +857,51 @@ def build_access_matrix(server_names=None, usernames=None):
             remote_user = server_result.get("users", {}).get(
                 source_user["username"], {}
             )
-            installed_hashes = set(remote_user.get("authorized_key_hashes", []))
-            matching_keys = len(expected_hashes & installed_hashes)
+            if "authorized_key_ids" in remote_user:
+                installed_key_ids = set(remote_user.get("authorized_key_ids", []))
+                matching_keys = len(expected_key_ids & installed_key_ids)
+                remote_key_count = remote_user.get(
+                    "authorized_key_count", len(installed_key_ids)
+                )
+            else:
+                # Compatibility with results produced by older remote probes.
+                expected_hashes = set(source_user.get("key_hashes", []))
+                installed_hashes = set(
+                    remote_user.get("authorized_key_hashes", [])
+                )
+                matching_keys = len(expected_hashes & installed_hashes)
+                remote_key_count = len(installed_hashes)
+            authorized_keys_readable = bool(
+                remote_user.get("authorized_keys_readable")
+            )
+            user_exists = bool(remote_user.get("user_exists"))
             key_installed = (
                 matching_keys > 0
-                if remote_user.get("authorized_keys_readable")
+                if authorized_keys_readable
                 else None
             )
+            all_keys_installed = None
+            if authorized_keys_readable:
+                all_keys_installed = (
+                    user_exists
+                    and expected_key_count > 0
+                    and matching_keys == expected_key_count
+                )
             user_item["servers"].append(
                 {
                     "server": server_name,
-                    "user_exists": bool(remote_user.get("user_exists")),
+                    "user_exists": user_exists,
                     "key_installed": key_installed,
-                    "accessible": bool(remote_user.get("user_exists"))
-                    and key_installed is True,
+                    "accessible": user_exists and key_installed is True,
+                    "all_keys_installed": all_keys_installed,
+                    "expected_key_count": expected_key_count,
+                    "installed_key_count": matching_keys,
+                    "missing_key_count": max(
+                        expected_key_count - matching_keys, 0
+                    ),
+                    "remote_key_count": (
+                        remote_key_count if authorized_keys_readable else None
+                    ),
                     "matching_key_count": matching_keys,
                     "error": server_result.get("error") or remote_user.get("error"),
                 }

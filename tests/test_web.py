@@ -63,6 +63,15 @@ class WebRouteTests(unittest.TestCase):
         self.assertNotIn("apiPollInterval", html)
         self.assertNotIn("scrollbar-gutter: stable", html)
 
+    def test_delete_account_ui_is_not_limited_by_matrix_scope(self):
+        response = self.client.get("/")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("将尝试在全部配置服务器终止该用户进程", html)
+        self.assertNotIn("deleteAccountButton.disabled = partialMatrix", html)
+        self.assertNotIn("servers: targetServers", html)
+
     def test_gpu_endpoint_returns_state_snapshot(self):
         snapshot = [{"server": "alpha", "gpus": [], "error": None}]
         with patch.object(web.gpu_state, "get_cached_data", return_value=snapshot):
@@ -159,6 +168,8 @@ class WebRouteTests(unittest.TestCase):
             ("post", "/api/users", {}),
             ("post", "/api/detect-users", {}),
             ("post", "/api/import-users", {}),
+            ("get", "/api/users/alice/keys", None),
+            ("delete", "/api/users/alice/keys", {}),
             ("delete", "/api/users/alice", {}),
             ("post", "/api/configure-access", {}),
         ]
@@ -192,6 +203,58 @@ class WebRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), expected)
         configure.assert_called_once_with(["alpha"], ["alice"])
+
+    def test_user_key_list_requires_admin_and_forwards_username(self):
+        expected = {
+            "error": None,
+            "username": "alice",
+            "key_count": 1,
+            "keys": [{"key_id": "a" * 64}],
+        }
+        with (
+            patch.object(web, "load_config", return_value={"admin_token": "secret"}),
+            patch.object(
+                web,
+                "list_user_keys",
+                return_value=(expected, 200),
+            ) as list_keys,
+        ):
+            response = self.client.get(
+                "/api/users/alice/keys",
+                headers={"X-Admin-Token": "secret"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), expected)
+        list_keys.assert_called_once_with("alice")
+
+    def test_delete_user_keys_forwards_batch_selection(self):
+        key_ids = ["a" * 64, "b" * 64]
+        expected = {
+            "error": None,
+            "username": "alice",
+            "requested_key_count": 2,
+            "selected_key_ids": key_ids,
+            "local": {"removed_keys": 2},
+            "results": [],
+        }
+        with (
+            patch.object(web, "load_config", return_value={"admin_token": "secret"}),
+            patch.object(
+                web,
+                "delete_user_keys",
+                return_value=(expected, 200),
+            ) as delete_keys,
+        ):
+            response = self.client.delete(
+                "/api/users/alice/keys",
+                headers={"X-Admin-Token": "secret"},
+                json={"key_ids": key_ids},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), expected)
+        delete_keys.assert_called_once_with("alice", {"key_ids": key_ids})
 
 
 if __name__ == "__main__":

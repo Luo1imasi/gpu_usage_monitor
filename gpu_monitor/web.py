@@ -9,7 +9,9 @@ from .access.service import (
     configure_access_pairs,
     configure_selected_access,
     delete_user_access,
+    delete_user_keys,
     detect_server_users,
+    list_user_keys,
     normalize_name_list,
 )
 from .config import get_configured_servers, get_monitoring_settings, load_config
@@ -142,6 +144,21 @@ def delete_user(username):
 
     payload = request.get_json(silent=True) or {}
     result, status_code = delete_user_access(username, payload)
+    return jsonify(result), status_code
+
+
+@bp.route("/api/users/<username>/keys", methods=["GET", "DELETE"])
+def user_keys(username):
+    if not is_admin_authorized():
+        return jsonify({"error": "admin_token_required"}), 403
+
+    if request.method == "GET":
+        result, status_code = list_user_keys(username)
+    else:
+        payload = request.get_json(silent=True)
+        if payload is None:
+            payload = {}
+        result, status_code = delete_user_keys(username, payload)
     return jsonify(result), status_code
 
 

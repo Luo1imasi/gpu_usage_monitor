@@ -7,11 +7,47 @@ application or the access-service state.
 
 import json
 
-from gpu_monitor.user_store import normalize_ssh_key
+from gpu_monitor.user_store import SSH_KEY_TYPES, normalize_ssh_key, ssh_key_id
 
 
 MIN_MANAGED_UID = 1000
 SYSTEM_SHELL_NAMES = {"false", "nologin", "sync", "halt", "shutdown"}
+
+
+def _public_key_identity_helper_source():
+    """Return shared remote code for strict authorized_keys identity parsing."""
+    return f"""
+import base64
+import binascii
+
+key_types = set({json.dumps(sorted(SSH_KEY_TYPES))})
+
+def public_key_identity(line):
+    normalized = " ".join(line.strip().split())
+    if not normalized or normalized.startswith("#"):
+        return None
+    parts = normalized.split()
+    for index, key_type in enumerate(parts[:-1]):
+        if key_type not in key_types:
+            continue
+        key_body = parts[index + 1]
+        try:
+            decoded = base64.b64decode(key_body.encode(), validate=True)
+        except (ValueError, binascii.Error):
+            continue
+        if len(decoded) < 4:
+            continue
+        type_length = int.from_bytes(decoded[:4], "big")
+        if type_length <= 0 or type_length > len(decoded) - 4:
+            continue
+        try:
+            embedded_type = decoded[4 : 4 + type_length].decode()
+        except UnicodeDecodeError:
+            continue
+        if embedded_type == key_type:
+            return key_type + " " + key_body
+    return None
+"""
 
 
 def build_configure_users_command(users):
@@ -19,6 +55,7 @@ def build_configure_users_command(users):
         {"username": user["username"], "ssh_keys": user["ssh_keys"]}
         for user in users
     ]
+    identity_helper = _public_key_identity_helper_source()
     script = f"""
 import json
 import os
@@ -26,6 +63,8 @@ import pwd
 import re
 import shutil
 import subprocess
+
+{identity_helper}
 
 users = {json.dumps(safe_users)}
 username_pattern = re.compile(r"^[a-z_][a-z0-9_-]*\\$?$")
@@ -108,19 +147,24 @@ for item in users:
             os.remove(sudo_config_file)
             result["errors"].append(proc.stderr.strip() or "visudo_failed")
 
-        existing_keys = set()
+        existing_key_identities = set()
         if os.path.exists(auth_keys):
             with open(auth_keys) as f:
-                existing_keys = {{" ".join(line.strip().split()) for line in f if line.strip()}}
+                for line in f:
+                    identity = public_key_identity(line)
+                    if identity is not None:
+                        existing_key_identities.add(identity)
 
         with open(auth_keys, "a") as f:
             for ssh_key in ssh_keys:
                 normalized_key = " ".join(ssh_key.strip().split())
-                if normalized_key in existing_keys:
+                identity = public_key_identity(normalized_key)
+                if identity is not None and identity in existing_key_identities:
                     result["keys_already_present"] += 1
                     continue
                 f.write(normalized_key + "\\n")
-                existing_keys.add(normalized_key)
+                if identity is not None:
+                    existing_key_identities.add(identity)
                 result["keys_added"] += 1
 
         os.chmod(auth_keys, 0o600)
@@ -180,6 +224,104 @@ for entry in pwd.getpwall():
 print(json.dumps(results, ensure_ascii=False))
 """
     return f"{runner} <<'PY'\n{script}\nPY"
+
+
+def build_remove_user_keys_command(username, ssh_keys):
+    """Build a narrowly scoped command that only removes selected SSH keys."""
+    selected_key_ids = sorted(
+        {
+            ssh_key_id(key)
+            for key in ssh_keys
+            if isinstance(key, str) and normalize_ssh_key(key)
+        }
+    )
+    identity_helper = _public_key_identity_helper_source()
+    script = f"""
+import hashlib
+import json
+import os
+import pwd
+import shutil
+import stat
+import tempfile
+
+{identity_helper}
+
+username = {json.dumps(username)}
+selected_key_ids = set({json.dumps(selected_key_ids)})
+
+result = {{
+    "user_exists": False,
+    "uid": None,
+    "authorized_keys_exists": False,
+    "requested_key_count": len(selected_key_ids),
+    "keys_removed": 0,
+    "removed_key_ids": [],
+    "errors": [],
+}}
+
+def public_key_id(line):
+    identity = public_key_identity(line)
+    if identity is None:
+        return None
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+try:
+    entry = pwd.getpwnam(username)
+    result["user_exists"] = True
+    result["uid"] = entry.pw_uid
+except KeyError:
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+
+if result["uid"] is not None and result["uid"] < {MIN_MANAGED_UID}:
+    result["errors"].append("refuse_system_user")
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+
+auth_keys = os.path.join(entry.pw_dir, ".ssh", "authorized_keys")
+try:
+    if os.path.lexists(auth_keys):
+        result["authorized_keys_exists"] = True
+        auth_keys_stat = os.lstat(auth_keys)
+        if not stat.S_ISREG(auth_keys_stat.st_mode):
+            raise OSError("authorized_keys_not_regular")
+        with open(auth_keys) as f:
+            existing_lines = f.readlines()
+
+        kept_lines = []
+        removed_key_ids = set()
+        for line in existing_lines:
+            key_id = public_key_id(line)
+            if key_id is not None and key_id in selected_key_ids:
+                result["keys_removed"] += 1
+                removed_key_ids.add(key_id)
+                continue
+            kept_lines.append(line)
+
+        if result["keys_removed"]:
+            temp_fd, temp_path = tempfile.mkstemp(
+                prefix=".authorized_keys.gpu-monitor-",
+                dir=os.path.dirname(auth_keys),
+                text=True,
+            )
+            try:
+                with os.fdopen(temp_fd, "w") as f:
+                    f.writelines(kept_lines)
+                os.chmod(temp_path, 0o600)
+                shutil.chown(temp_path, user=username, group=entry.pw_gid)
+                os.replace(temp_path, auth_keys)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+        result["removed_key_ids"] = sorted(removed_key_ids)
+except Exception as exc:
+    result["errors"].append("authorized_keys_" + exc.__class__.__name__)
+
+print(json.dumps(result, ensure_ascii=False))
+"""
+    return f"sudo -n python3 - <<'PY'\n{script}\nPY"
 
 
 def build_revoke_user_command(
@@ -405,20 +547,31 @@ print(json.dumps(result, ensure_ascii=False))
 
 def build_access_check_command(usernames, use_sudo=True):
     runner = "sudo -n python3 -" if use_sudo else "python3 -"
+    identity_helper = _public_key_identity_helper_source()
     script = f"""
 import hashlib
 import json
 import os
 import pwd
 
+{identity_helper}
+
 usernames = {json.dumps(usernames)}
 results = {{}}
+
+def public_key_id(line):
+    identity = public_key_identity(line)
+    if identity is None:
+        return None
+    return hashlib.sha256(identity.encode()).hexdigest()
 
 for username in usernames:
     item = {{
         "user_exists": False,
         "authorized_keys_readable": False,
         "authorized_key_hashes": [],
+        "authorized_key_ids": [],
+        "authorized_key_count": 0,
         "error": None,
     }}
     try:
@@ -428,12 +581,18 @@ for username in usernames:
         try:
             with open(auth_keys) as f:
                 hashes = []
+                key_ids = []
                 for line in f:
                     normalized = " ".join(line.strip().split())
                     if normalized and not normalized.startswith("#"):
                         hashes.append(hashlib.sha256(normalized.encode()).hexdigest())
+                        key_id = public_key_id(normalized)
+                        if key_id is not None:
+                            key_ids.append(key_id)
                 item["authorized_keys_readable"] = True
                 item["authorized_key_hashes"] = sorted(set(hashes))
+                item["authorized_key_ids"] = sorted(set(key_ids))
+                item["authorized_key_count"] = len(item["authorized_key_ids"])
         except FileNotFoundError:
             item["authorized_keys_readable"] = True
         except PermissionError:

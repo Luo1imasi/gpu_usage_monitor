@@ -7,10 +7,10 @@ from unittest.mock import patch
 from gpu_monitor import user_store
 
 
-def make_public_key(comment="test-key"):
+def make_public_key(comment="test-key", payload=b"test-payload"):
     key_type = b"ssh-ed25519"
-    payload = len(key_type).to_bytes(4, "big") + key_type + b"test-payload"
-    encoded = base64.b64encode(payload).decode()
+    key_data = len(key_type).to_bytes(4, "big") + key_type + payload
+    encoded = base64.b64encode(key_data).decode()
     return f"ssh-ed25519 {encoded} {comment}"
 
 
@@ -54,6 +54,34 @@ class UserStoreTests(unittest.TestCase):
         self.assertEqual(result["error"], "ssh_key_already_exists")
         self.assertEqual(result["matches"][0]["username"], "alice")
         self.assertEqual(result["matches"][0]["match_type"], "key_body")
+
+    def test_key_id_is_stable_when_comment_changes(self):
+        first_key = make_public_key("laptop")
+        second_key = make_public_key("renamed")
+
+        self.assertEqual(
+            user_store.ssh_key_id(first_key),
+            user_store.ssh_key_id(second_key),
+        )
+
+    def test_remove_selected_user_key_keeps_other_keys(self):
+        first_key = make_public_key("laptop", b"first-key")
+        second_key = make_public_key("desktop", b"second-key")
+        user_store.add_user_key("alice", first_key)
+        user_store.add_user_key("alice", second_key)
+
+        first_key_id = user_store.ssh_key_id(first_key)
+        result, status = user_store.remove_user_keys_from_file(
+            "alice", [first_key_id]
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["removed_keys"], 1)
+        self.assertEqual(result["removed_lines"], 1)
+        self.assertEqual(result["removed_key_ids"], [first_key_id])
+        self.assertEqual(result["remaining_key_count"], 1)
+        users = user_store.load_user_keys()
+        self.assertEqual(users[0]["ssh_keys"], [second_key])
 
     def test_generation_changes_after_successful_mutations(self):
         original_generation = user_store.get_user_store_generation()

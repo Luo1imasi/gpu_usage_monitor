@@ -52,6 +52,28 @@ def ssh_key_identity(key):
     return " ".join(parts[:2])
 
 
+def ssh_key_id(key):
+    """Return a stable identifier for the cryptographic public key.
+
+    Comments are intentionally excluded so that changing a key label does not
+    make the same public key look like a different credential.
+    """
+    normalized = normalize_ssh_key(key)
+    identity = ssh_key_identity(normalized) or normalized
+    return key_fingerprint(identity)
+
+
+def describe_ssh_key(key):
+    normalized = normalize_ssh_key(key)
+    parts = normalized.split()
+    return {
+        "key_id": ssh_key_id(normalized),
+        "ssh_key": normalized,
+        "key_type": parts[0] if parts else None,
+        "comment": " ".join(parts[2:]) if len(parts) > 2 else "",
+    }
+
+
 def parse_ssh_public_key(key):
     parts = normalize_ssh_key(key).split()
     if len(parts) < 2:
@@ -185,6 +207,74 @@ def remove_user_from_file(username):
     return {"username": username, "removed_lines": removed_lines}, 200
 
 
+def remove_user_keys_from_file(username, key_ids):
+    """Remove only selected keys for a user, identified independently of comments."""
+    if not validate_username(username):
+        return {"error": "invalid_username"}, 400
+    if not isinstance(key_ids, (list, tuple, set)):
+        return {"error": "key_ids_must_be_a_list"}, 400
+
+    requested_key_ids = {
+        key_id for key_id in key_ids if isinstance(key_id, str) and key_id
+    }
+    if not requested_key_ids:
+        return {"error": "select_at_least_one_key"}, 400
+
+    with user_file_lock:
+        try:
+            with open(USER_FILE_PATH) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return {
+                "username": username,
+                "requested_key_count": len(requested_key_ids),
+                "removed_keys": 0,
+                "removed_lines": 0,
+                "removed_key_ids": [],
+                "remaining_key_count": 0,
+            }, 200
+
+        kept_lines = []
+        removed_lines = 0
+        removed_key_ids = set()
+        remaining_key_ids = set()
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                kept_lines.append(line)
+                continue
+
+            parts = stripped.split(None, 1)
+            if len(parts) != 2 or parts[0] != username:
+                kept_lines.append(line)
+                continue
+
+            key_id = ssh_key_id(parts[1])
+            if key_id in requested_key_ids:
+                removed_lines += 1
+                removed_key_ids.add(key_id)
+                continue
+
+            remaining_key_ids.add(key_id)
+            kept_lines.append(line)
+
+        if removed_lines:
+            tmp_path = USER_FILE_PATH.with_suffix(USER_FILE_PATH.suffix + ".tmp")
+            with open(tmp_path, "w") as f:
+                f.writelines(kept_lines)
+            os.replace(tmp_path, USER_FILE_PATH)
+            _bump_user_store_generation()
+
+    return {
+        "username": username,
+        "requested_key_count": len(requested_key_ids),
+        "removed_keys": len(removed_key_ids),
+        "removed_lines": removed_lines,
+        "removed_key_ids": sorted(removed_key_ids),
+        "remaining_key_count": len(remaining_key_ids),
+    }, 200
+
+
 def add_user_key(username, ssh_key):
     if not validate_username(username):
         return {"error": "invalid_username"}, 400
@@ -225,9 +315,11 @@ def load_user_keys():
                         users[username] = {
                             "username": username,
                             "key_hashes": set(),
+                            "key_ids": set(),
                             "ssh_keys": [],
                         }
                     users[username]["key_hashes"].add(fingerprint)
+                    users[username]["key_ids"].add(ssh_key_id(ssh_key))
                     if ssh_key not in users[username]["ssh_keys"]:
                         users[username]["ssh_keys"].append(ssh_key)
         except FileNotFoundError:
@@ -237,6 +329,7 @@ def load_user_keys():
         {
             "username": user["username"],
             "key_hashes": sorted(user["key_hashes"]),
+            "key_ids": sorted(user["key_ids"]),
             "ssh_keys": user["ssh_keys"],
         }
         for user in sorted(users.values(), key=lambda item: item["username"])
@@ -349,3 +442,19 @@ def import_user_keys(items):
 
 def get_users_by_name():
     return {user["username"]: user for user in load_user_keys()}
+
+
+def get_user_key_records(username):
+    user = get_users_by_name().get(username)
+    if user is None:
+        return None
+
+    records = []
+    seen_key_ids = set()
+    for ssh_key in user["ssh_keys"]:
+        record = describe_ssh_key(ssh_key)
+        if record["key_id"] in seen_key_ids:
+            continue
+        seen_key_ids.add(record["key_id"])
+        records.append(record)
+    return records
