@@ -192,6 +192,152 @@ class AccessServiceTests(unittest.TestCase):
         remove_local.assert_called_once_with("alice")
         self.assertEqual(result["local"], local_result)
 
+    def test_list_user_keys_reports_accessible_server_count_per_key(self):
+        first_key = "ssh-ed25519 first-body laptop"
+        second_key = "ssh-ed25519 second-body desktop"
+        first_key_id = ssh_key_id(first_key)
+        second_key_id = ssh_key_id(second_key)
+        keys = [
+            {
+                "key_id": first_key_id,
+                "ssh_key": first_key,
+                "key_type": "ssh-ed25519",
+                "comment": "laptop",
+            },
+            {
+                "key_id": second_key_id,
+                "ssh_key": second_key,
+                "key_type": "ssh-ed25519",
+                "comment": "desktop",
+            },
+        ]
+        servers = [
+            {"name": "alpha"},
+            {"name": "beta"},
+            {"name": "gamma"},
+            {"name": "delta"},
+            {"name": "epsilon"},
+            {"name": "zeta"},
+        ]
+        server_results = {
+            "alpha": {
+                "server": "alpha",
+                "error": None,
+                "users": {
+                    "alice": {
+                        "user_exists": True,
+                        "authorized_keys_readable": True,
+                        "authorized_key_ids": [
+                            first_key_id,
+                            second_key_id,
+                            first_key_id,
+                        ],
+                        "error": None,
+                    }
+                },
+            },
+            "beta": {
+                "server": "beta",
+                "error": None,
+                "users": {
+                    "alice": {
+                        "user_exists": True,
+                        "authorized_keys_readable": True,
+                        "authorized_key_ids": [first_key_id],
+                        "error": None,
+                    }
+                },
+            },
+            "gamma": {
+                "server": "gamma",
+                "error": None,
+                "users": {
+                    "alice": {
+                        "user_exists": False,
+                        "authorized_keys_readable": False,
+                        "authorized_key_ids": [],
+                        "error": None,
+                    }
+                },
+            },
+            "delta": {
+                "server": "delta",
+                "error": "offline",
+                "users": {},
+            },
+            "epsilon": {
+                "server": "epsilon",
+                "error": None,
+                "users": {
+                    "alice": {
+                        "user_exists": True,
+                        "authorized_keys_readable": False,
+                        "authorized_key_ids": [],
+                        "error": "permission_denied",
+                    }
+                },
+            },
+            "zeta": {
+                "server": "zeta",
+                "error": None,
+                "users": {
+                    "alice": {
+                        "user_exists": True,
+                        "authorized_keys_readable": False,
+                        "authorized_key_ids": [],
+                        "error": None,
+                    }
+                },
+            },
+        }
+
+        with (
+            patch.object(service, "get_user_key_records", return_value=keys),
+            patch.object(service, "get_configured_servers", return_value=servers),
+            patch.object(
+                service,
+                "check_access_matrix_for_servers",
+                return_value=server_results,
+            ) as check_servers,
+        ):
+            result, status = service.list_user_keys("alice")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["server_count"], 6)
+        self.assertEqual(result["unknown_server_count"], 3)
+        self.assertEqual(
+            [key["accessible_server_count"] for key in result["keys"]],
+            [2, 1],
+        )
+        check_servers.assert_called_once_with(
+            servers,
+            [{"username": "alice"}],
+        )
+
+    def test_list_user_keys_with_no_servers_reports_zero_counts(self):
+        ssh_key = "ssh-ed25519 first-body laptop"
+        keys = [
+            {
+                "key_id": ssh_key_id(ssh_key),
+                "ssh_key": ssh_key,
+                "key_type": "ssh-ed25519",
+                "comment": "laptop",
+            }
+        ]
+
+        with (
+            patch.object(service, "get_user_key_records", return_value=keys),
+            patch.object(service, "get_configured_servers", return_value=[]),
+            patch.object(service, "check_access_matrix_for_servers") as check_servers,
+        ):
+            result, status = service.list_user_keys("alice")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["server_count"], 0)
+        self.assertEqual(result["unknown_server_count"], 0)
+        self.assertEqual(result["keys"][0]["accessible_server_count"], 0)
+        check_servers.assert_not_called()
+
     def test_connection_account_keys_are_protected(self):
         with patch.object(
             service,

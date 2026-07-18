@@ -649,7 +649,8 @@
         }
 
         .key-delete-option-main,
-        .key-delete-option-meta {
+        .key-delete-option-meta,
+        .key-delete-option-access {
             display: block;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -666,6 +667,12 @@
             color: #858585;
             font-family: monospace;
             font-size: 0.72em;
+        }
+
+        .key-delete-option-access {
+            margin-top: 4px;
+            color: #4ec9b0;
+            font-size: 0.74em;
         }
 
         .key-delete-dialog-result {
@@ -2639,6 +2646,41 @@
             setDeleteKeyDialogResult('已选择 ' + selectedCount + '/' + totalCount + ' 把 Key', false);
         }
 
+        function normalizeDeleteKeyServerCount(value) {
+            if (value === undefined || value === null || value === '') {
+                return null;
+            }
+            const count = Number(value);
+            return Number.isFinite(count) && count >= 0 ? Math.floor(count) : null;
+        }
+
+        function getDeleteKeyAccessText(key) {
+            const accessibleCount = normalizeDeleteKeyServerCount(key.accessible_server_count);
+            const totalServerCount = normalizeDeleteKeyServerCount(
+                key.total_server_count !== undefined
+                    ? key.total_server_count
+                    : (pendingKeyDeletion && pendingKeyDeletion.totalServerCount)
+            );
+            const keyUnknownCount = key.access_unknown_server_count !== undefined
+                ? key.access_unknown_server_count
+                : key.unknown_server_count;
+            const unknownServerCount = normalizeDeleteKeyServerCount(
+                keyUnknownCount !== undefined
+                    ? keyUnknownCount
+                    : (pendingKeyDeletion && pendingKeyDeletion.unknownServerCount)
+            );
+
+            let text = accessibleCount === null
+                ? '可访问服务器数量未知'
+                : '可访问服务器 ' + accessibleCount
+                    + (totalServerCount === null ? '' : '/' + totalServerCount)
+                    + ' 台';
+            if (unknownServerCount !== null && unknownServerCount > 0) {
+                text += '（另有 ' + unknownServerCount + ' 台状态未知）';
+            }
+            return text;
+        }
+
         function renderDeleteKeyDialog(username, keys) {
             const dialog = document.getElementById('key-delete-dialog');
             const description = document.getElementById('key-delete-dialog-description');
@@ -2665,8 +2707,12 @@
                 const meta = document.createElement('span');
                 meta.className = 'key-delete-option-meta';
                 meta.textContent = labelText.meta;
+                const access = document.createElement('span');
+                access.className = 'key-delete-option-access';
+                access.textContent = getDeleteKeyAccessText(key);
                 content.appendChild(main);
                 content.appendChild(meta);
+                content.appendChild(access);
                 option.appendChild(checkbox);
                 option.appendChild(content);
                 list.appendChild(option);
@@ -2743,6 +2789,10 @@
                     username: data.username || username,
                     token: token,
                     keys: keys,
+                    totalServerCount: data.total_server_count !== undefined
+                        ? data.total_server_count
+                        : data.server_count,
+                    unknownServerCount: data.unknown_server_count,
                     busy: false
                 };
                 renderDeleteKeyDialog(pendingKeyDeletion.username, keys);

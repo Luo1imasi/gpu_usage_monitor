@@ -72,6 +72,27 @@ class WebRouteTests(unittest.TestCase):
         self.assertNotIn("deleteAccountButton.disabled = partialMatrix", html)
         self.assertNotIn("servers: targetServers", html)
 
+    def test_delete_key_dialog_shows_accessible_server_counts(self):
+        response = self.client.get("/")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        for marker in (
+            "function getDeleteKeyAccessText(key)",
+            "key.accessible_server_count",
+            "key.total_server_count",
+            "key.access_unknown_server_count",
+            "key.unknown_server_count",
+            "data.total_server_count",
+            "data.server_count",
+            "data.unknown_server_count",
+            "access.className = 'key-delete-option-access'",
+            "'可访问服务器 ' + accessibleCount",
+            "' 台状态未知）'",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, html)
+
     def test_gpu_endpoint_returns_state_snapshot(self):
         snapshot = [{"server": "alpha", "gpus": [], "error": None}]
         with patch.object(web.gpu_state, "get_cached_data", return_value=snapshot):

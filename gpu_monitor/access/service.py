@@ -28,6 +28,7 @@ from gpu_monitor.user_store import (
     get_user_key_records,
     get_user_store_generation,
     get_users_by_name,
+    key_fingerprint,
     load_user_keys,
     remove_user_keys_from_file,
     remove_user_from_file,
@@ -398,10 +399,52 @@ def list_user_keys(username):
     if keys is None:
         return {"error": "user_not_found", "username": username, "keys": []}, 404
 
+    servers = get_configured_servers()
+    access_counts = {key["key_id"]: 0 for key in keys}
+    unknown_server_count = 0
+    if servers:
+        server_results = check_access_matrix_for_servers(
+            servers,
+            [{"username": username}],
+        )
+        for server in servers:
+            server_result = server_results.get(
+                server["name"],
+                {"error": "No result", "users": {}},
+            )
+            remote_user = server_result.get("users", {}).get(username, {})
+            if server_result.get("error") or remote_user.get("error"):
+                unknown_server_count += 1
+                continue
+            if not remote_user.get("user_exists"):
+                continue
+            if not remote_user.get("authorized_keys_readable"):
+                unknown_server_count += 1
+                continue
+
+            if "authorized_key_ids" in remote_user:
+                installed_key_ids = set(remote_user.get("authorized_key_ids", []))
+                for key_id in access_counts:
+                    if key_id in installed_key_ids:
+                        access_counts[key_id] += 1
+            else:
+                # Compatibility with results produced by older remote probes.
+                installed_hashes = set(
+                    remote_user.get("authorized_key_hashes", [])
+                )
+                for key in keys:
+                    if key_fingerprint(key.get("ssh_key", "")) in installed_hashes:
+                        access_counts[key["key_id"]] += 1
+
+    for key in keys:
+        key["accessible_server_count"] = access_counts[key["key_id"]]
+
     return {
         "error": None,
         "username": username,
         "key_count": len(keys),
+        "server_count": len(servers),
+        "unknown_server_count": unknown_server_count,
         "keys": keys,
     }, 200
 
@@ -696,6 +739,27 @@ def check_access_matrix_for_server(server, users):
         }
 
 
+def check_access_matrix_for_servers(servers, users):
+    futures = {
+        admin_executor.submit(check_access_matrix_for_server, server, users): server
+        for server in servers
+    }
+    server_results = {}
+    for future in as_completed(futures):
+        server = futures[future]
+        try:
+            result = future.result()
+        except Exception as e:
+            logger.error("Unexpected access check error for %s: %s", server["name"], e)
+            result = {
+                "server": server["name"],
+                "error": sanitize_error(str(e)),
+                "users": {},
+            }
+        server_results[result["server"]] = result
+    return server_results
+
+
 def resolve_access_matrix_scope(server_names=None, usernames=None):
     all_servers = get_configured_servers()
     servers_by_name = {
@@ -825,23 +889,7 @@ def build_access_matrix(server_names=None, usernames=None):
         set_cached_access_matrix(cache_key, matrix)
         return matrix, 200
 
-    futures = {
-        admin_executor.submit(check_access_matrix_for_server, server, users): server
-        for server in servers
-    }
-    server_results = {}
-    for future in as_completed(futures):
-        server = futures[future]
-        try:
-            result = future.result()
-        except Exception as e:
-            logger.error("Unexpected access check error for %s: %s", server["name"], e)
-            result = {
-                "server": server["name"],
-                "error": sanitize_error(str(e)),
-                "users": {},
-            }
-        server_results[result["server"]] = result
+    server_results = check_access_matrix_for_servers(servers, users)
 
     for user_item, source_user in zip(matrix["users"], users):
         expected_key_ids = set(
