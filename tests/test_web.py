@@ -55,7 +55,11 @@ class WebRouteTests(unittest.TestCase):
             "storageScrollState",
             "server.user_min_bytes",
             "server.filtered_user_count",
-            "setInterval(refresh, refreshInterval * 1000)",
+            "let gpuRefreshTimer = null",
+            "function updateGpuRefreshTimer()",
+            "gpuRefreshTimer = setInterval(refresh, refreshInterval * 1000)",
+            "document.addEventListener('visibilitychange'",
+            "if (!document.hidden)",
             "setInterval(refreshStorage, 60000)",
         ):
             with self.subTest(marker=marker):

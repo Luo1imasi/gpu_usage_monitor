@@ -1342,6 +1342,7 @@
     
     <script>
         let refreshInterval = 2;
+        let gpuRefreshTimer = null;
         let configuredServers = [];
         let latestAccessMatrix = null;
         let latestDetectedUserItems = [];
@@ -1485,6 +1486,16 @@
             });
         }
         
+        function updateGpuRefreshTimer() {
+            if (gpuRefreshTimer !== null) {
+                clearInterval(gpuRefreshTimer);
+                gpuRefreshTimer = null;
+            }
+            if (!document.hidden) {
+                gpuRefreshTimer = setInterval(refresh, refreshInterval * 1000);
+            }
+        }
+
         async function init() {
             document.getElementById('configure-access').addEventListener('click', configureSelectedAccess);
             document.getElementById('refresh-access-matrix').addEventListener('click', refreshAccessMatrix);
@@ -1531,7 +1542,13 @@
             }
             
             await Promise.all([refresh(), refreshStorage()]);
-            setInterval(refresh, refreshInterval * 1000);
+            updateGpuRefreshTimer();
+            document.addEventListener('visibilitychange', () => {
+                updateGpuRefreshTimer();
+                if (!document.hidden) {
+                    refresh();
+                }
+            });
             setInterval(refreshStorage, 60000);
         }
         
