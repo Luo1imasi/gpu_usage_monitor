@@ -1,15 +1,35 @@
 import unittest
+import tempfile
+import base64
+from contextlib import contextmanager
 from unittest.mock import patch
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from flask import url_for
 
 from gpu_monitor import web
+from gpu_monitor import auth
+from gpu_monitor.user_store import ssh_key_id
 
 
 class WebRouteTests(unittest.TestCase):
     def setUp(self):
-        self.app = web.create_app()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.app = web.create_app({"AUTH_DATABASE": directory.name + "/auth.sqlite3"})
         self.client = self.app.test_client()
+        self.client.environ_base["HTTP_X_MONITOR_REQUEST"] = "1"
+        key = ed25519.Ed25519PrivateKey.generate()
+        public = key.public_key().public_bytes(serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH).decode()
+        user_patch = patch.object(auth, "load_user_keys", return_value=[{"username": "viewer", "ssh_keys": [public]}])
+        user_patch.start()
+        self.addCleanup(user_patch.stop)
+        challenge = self.client.post("/api/auth/challenge", json={"key_id": ssh_key_id(public)}).get_json()
+        signature = base64.b64encode(key.sign(challenge["message"].encode())).decode()
+        response = self.client.post("/api/auth/verify", json={"challenge_id": challenge["challenge_id"], "signature": signature})
+        self.assertEqual(response.status_code, 200)
 
     def test_factory_registers_blueprint_without_static_route(self):
         with self.app.test_request_context():
@@ -75,6 +95,80 @@ class WebRouteTests(unittest.TestCase):
         self.assertIn("将尝试在全部配置服务器终止该用户进程", html)
         self.assertNotIn("deleteAccountButton.disabled = partialMatrix", html)
         self.assertNotIn("servers: targetServers", html)
+
+    def test_zero_key_users_keep_account_action_but_disable_key_actions(self):
+        response = self.client.get("/")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        for marker in (
+            "function getLocalKeyCount(user)",
+            "const hasLocalKeys = localKeyCount > 0",
+            "user.username + '（无本地 Key）'",
+            "deleteButton.disabled = !hasLocalKeys",
+            "!hasLocalKeys || status.error",
+            "statusText.textContent = '无本地 Key'",
+            "if (getLocalKeyCount(user) === 0)",
+            ".access-pair-select:checked:not(:disabled)",
+            "userCell.appendChild(deleteAccountButton)",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, html)
+        self.assertNotIn("deleteAccountButton.disabled = !hasLocalKeys", html)
+
+    def test_revoke_access_ui_selects_installed_cells_and_posts_selected_pairs(self):
+        response = self.client.get("/")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        for marker in (
+            'id="revoke-access"',
+            "document.getElementById('revoke-access').addEventListener('click', revokeSelectedAccess)",
+            "checkbox.dataset.installed = installedKeyCount > 0 ? 'true' : 'false'",
+            "checkbox.dataset.baseDisabled = Boolean(",
+            "!hasLocalKeys || status.error",
+            "function selectConfiguredAccess()",
+            "input.checked = !input.disabled && input.dataset.installed === 'true'",
+            "async function revokeSelectedAccess()",
+            "fetch('/api/revoke-access'",
+            "body: JSON.stringify({pairs: pairs})",
+            "function requireFreshAccessMatrix()",
+            "accessMatrixStale = true",
+            "setAccessMutationBusy(true)",
+            "setAccessMutationBusy(false)",
+            "input.disabled = matrixActionsDisabled || input.dataset.baseDisabled === 'true'",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, html)
+
+    def test_access_matrix_ui_fences_mutations_without_exposing_protected_users(self):
+        response = self.client.get("/")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        for marker in (
+            "let accessMutationGeneration = 0",
+            "const requestMutationGeneration = accessMutationGeneration",
+            "if (requestMutationGeneration !== accessMutationGeneration)",
+            "accessMutationGeneration++",
+            "function clearAccessPairChecks()",
+            "function discardObsoleteAccessMatrixResponse(",
+            "discardObsoleteAccessMatrixResponse(requestMutationGeneration, matrixDiv)",
+            "data.error === 'invalid_selection' || response.status >= 500",
+            ".access-actions button.access-danger:disabled",
+            ".user-row-action.access-danger:disabled",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, html)
+
+        self.assertGreaterEqual(html.count("clearAccessPairChecks();"), 3)
+        self.assertEqual(
+            html.count("data.error === 'invalid_selection' || response.status >= 500"),
+            2,
+        )
+        self.assertNotIn("user.protected", html)
+        self.assertNotIn("isProtected", html)
+        self.assertNotIn("（受保护）", html)
 
     def test_delete_key_dialog_shows_accessible_server_counts(self):
         response = self.client.get("/")
@@ -197,6 +291,7 @@ class WebRouteTests(unittest.TestCase):
             ("delete", "/api/users/alice/keys", {}),
             ("delete", "/api/users/alice", {}),
             ("post", "/api/configure-access", {}),
+            ("post", "/api/revoke-access", {}),
         ]
 
         with patch.object(web, "load_config", return_value={"admin_token": "secret"}):
@@ -228,6 +323,150 @@ class WebRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), expected)
         configure.assert_called_once_with(["alpha"], ["alice"])
+
+    def test_revoke_access_requires_a_nonempty_pair_list(self):
+        with (
+            patch.object(web, "load_config", return_value={"admin_token": "secret"}),
+            patch.object(web, "revoke_access_pairs") as revoke,
+        ):
+            for payload in ({}, {"pairs": []}, {"pairs": "alpha:alice"}):
+                with self.subTest(payload=payload):
+                    response = self.client.post(
+                        "/api/revoke-access",
+                        headers={"X-Admin-Token": "secret"},
+                        json=payload,
+                    )
+
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(
+                        response.get_json(),
+                        {"error": "select_at_least_one_access_pair"},
+                    )
+
+        revoke.assert_not_called()
+
+    def test_revoke_access_rejects_non_object_json(self):
+        with (
+            patch.object(web, "load_config", return_value={"admin_token": "secret"}),
+            patch.object(web, "revoke_access_pairs") as revoke,
+        ):
+            for payload in ([], "alpha:alice", 1, True):
+                with self.subTest(payload=payload):
+                    response = self.client.post(
+                        "/api/revoke-access",
+                        headers={"X-Admin-Token": "secret"},
+                        json=payload,
+                    )
+
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(
+                        response.get_json(),
+                        {"error": "request_body_must_be_an_object"},
+                    )
+
+        revoke.assert_not_called()
+
+    def test_revoke_access_forwards_selected_pairs(self):
+        pairs = [
+            {"server": "alpha", "user": "alice"},
+            {"server": "beta", "user": "bob"},
+        ]
+        expected = {
+            "error": None,
+            "local_keys_preserved": True,
+            "results": [
+                {
+                    "server": "alpha",
+                    "user": "alice",
+                    "error": None,
+                    "result": {"keys_removed": 1},
+                }
+            ],
+        }
+        with (
+            patch.object(web, "load_config", return_value={"admin_token": "secret"}),
+            patch.object(
+                web,
+                "revoke_access_pairs",
+                return_value=(expected, 200),
+            ) as revoke,
+        ):
+            response = self.client.post(
+                "/api/revoke-access",
+                headers={"X-Admin-Token": "secret"},
+                json={"pairs": pairs},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), expected)
+        revoke.assert_called_once_with(pairs)
+
+    def test_add_user_holds_user_operation_lock(self):
+        events = []
+
+        @contextmanager
+        def record_lock(usernames):
+            events.append(("enter", usernames))
+            try:
+                yield
+            finally:
+                events.append(("exit", usernames))
+
+        def add_key(username, ssh_key):
+            self.assertEqual(events, [("enter", ["alice"])])
+            return {"username": username, "key_added": True}, 200
+
+        with (
+            patch.object(web, "load_config", return_value={"admin_token": "secret"}),
+            patch.object(web, "serialize_user_operations", side_effect=record_lock),
+            patch.object(web, "add_user_key", side_effect=add_key) as add,
+        ):
+            response = self.client.post(
+                "/api/users",
+                headers={"X-Admin-Token": "secret"},
+                json={"username": "alice", "ssh_key": "key"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        add.assert_called_once_with("alice", "key")
+        self.assertEqual(events, [("enter", ["alice"]), ("exit", ["alice"])])
+
+    def test_import_users_holds_all_user_operation_locks(self):
+        items = [
+            {"username": "bob", "ssh_key": "bob-key"},
+            {"username": "alice", "ssh_key": "alice-key"},
+        ]
+        events = []
+
+        @contextmanager
+        def record_lock(usernames):
+            events.append(("enter", usernames))
+            try:
+                yield
+            finally:
+                events.append(("exit", usernames))
+
+        def import_keys(received_items):
+            self.assertEqual(events, [("enter", ["bob", "alice"])])
+            return {"error": None, "imported": [], "skipped": [], "errors": []}, 200
+
+        with (
+            patch.object(web, "load_config", return_value={"admin_token": "secret"}),
+            patch.object(web, "serialize_user_operations", side_effect=record_lock),
+            patch.object(web, "import_user_keys", side_effect=import_keys) as import_keys_mock,
+        ):
+            response = self.client.post(
+                "/api/import-users",
+                headers={"X-Admin-Token": "secret"},
+                json={"items": items},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        import_keys_mock.assert_called_once_with(items)
+        self.assertEqual(
+            events,
+            [("enter", ["bob", "alice"]), ("exit", ["bob", "alice"])],
+        )
 
     def test_user_key_list_requires_admin_and_forwards_username(self):
         expected = {

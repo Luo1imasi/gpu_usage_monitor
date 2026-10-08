@@ -6,6 +6,12 @@ import app
 
 
 class EntrypointTests(unittest.TestCase):
+    def test_trusted_proxy_only_binds_loopback(self):
+        with patch.dict(os.environ, {"GPU_MONITOR_TRUST_PROXY": "1"}, clear=True):
+            self.assertEqual(app._bind_host(), "127.0.0.1")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(app._bind_host(), "0.0.0.0")
+
     def test_runtime_starts_for_normal_server(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertTrue(app._should_start_runtime(debug=False))

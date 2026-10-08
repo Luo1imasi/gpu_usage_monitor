@@ -24,6 +24,11 @@ def _should_start_runtime(debug):
     return not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
 
 
+def _bind_host():
+    """Keep trusted forwarded headers behind the local reverse proxy."""
+    return "127.0.0.1" if os.environ.get("GPU_MONITOR_TRUST_PROXY") == "1" else "0.0.0.0"
+
+
 atexit.register(runtime.close)
 
 
@@ -35,9 +40,10 @@ if __name__ == "__main__":
     if runtime_started:
         runtime.start()
 
-    logger.info("Running Flask app on 0.0.0.0:5000 (debug=%s)", debug)
+    host = _bind_host()
+    logger.info("Running Flask app on %s:5000 (debug=%s)", host, debug)
     try:
-        app.run(host="0.0.0.0", port=5000, debug=debug)
+        app.run(host=host, port=5000, debug=debug)
     finally:
         if runtime_started:
             runtime.close()

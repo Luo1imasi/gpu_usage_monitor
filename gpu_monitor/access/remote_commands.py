@@ -22,14 +22,32 @@ import binascii
 
 key_types = set({json.dumps(sorted(SSH_KEY_TYPES))})
 
-def public_key_identity(line):
-    normalized = " ".join(line.strip().split())
-    if not normalized or normalized.startswith("#"):
-        return None
-    parts = normalized.split()
-    for index, key_type in enumerate(parts[:-1]):
-        if key_type not in key_types:
+def authorized_key_prefix_fields(line):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return []
+
+    in_quotes = False
+    escaped = False
+    for index, char in enumerate(stripped):
+        if escaped:
+            escaped = False
             continue
+        if char == "\\\\":
+            escaped = True
+            continue
+        if char == '\"':
+            in_quotes = not in_quotes
+            continue
+        if char.isspace() and not in_quotes:
+            first_field = stripped[:index]
+            remaining = stripped[index:].strip().split(None, 2)
+            return [first_field] + remaining[:2]
+    return [stripped]
+
+def public_key_identity(line):
+    parts = authorized_key_prefix_fields(line)
+    for index, candidate_type in enumerate(parts[:-1]):
         key_body = parts[index + 1]
         try:
             decoded = base64.b64decode(key_body.encode(), validate=True)
@@ -44,9 +62,44 @@ def public_key_identity(line):
             embedded_type = decoded[4 : 4 + type_length].decode()
         except UnicodeDecodeError:
             continue
-        if embedded_type == key_type:
-            return key_type + " " + key_body
+        if embedded_type != candidate_type:
+            continue
+        if candidate_type not in key_types:
+            return None
+        return candidate_type + " " + key_body
     return None
+"""
+
+
+def _authorized_keys_lock_helper_source():
+    """Return remote code that serializes writers on one opened key file."""
+    return """
+import fcntl
+import os
+from contextlib import contextmanager
+
+@contextmanager
+def locked_authorized_keys_file(file_fd):
+    fcntl.flock(file_fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(file_fd, fcntl.LOCK_UN)
+
+def same_open_entry(file_fd, directory_fd, name):
+    opened_stat = os.fstat(file_fd)
+    try:
+        named_stat = os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    return (
+        named_stat.st_dev == opened_stat.st_dev
+        and named_stat.st_ino == opened_stat.st_ino
+    )
 """
 
 
@@ -56,15 +109,17 @@ def build_configure_users_command(users):
         for user in users
     ]
     identity_helper = _public_key_identity_helper_source()
+    lock_helper = _authorized_keys_lock_helper_source()
     script = f"""
 import json
 import os
 import pwd
 import re
-import shutil
+import stat
 import subprocess
 
 {identity_helper}
+{lock_helper}
 
 users = {json.dumps(safe_users)}
 username_pattern = re.compile(r"^[a-z_][a-z0-9_-]*\\$?$")
@@ -119,12 +174,6 @@ for item in users:
     try:
         entry = pwd.getpwnam(username)
         user_home = entry.pw_dir
-        ssh_dir = os.path.join(user_home, ".ssh")
-        auth_keys = os.path.join(ssh_dir, "authorized_keys")
-
-        os.makedirs(ssh_dir, exist_ok=True)
-        os.chmod(ssh_dir, 0o700)
-        shutil.chown(ssh_dir, user=username, group=entry.pw_gid)
 
         if admin_group:
             groups_proc = run(["id", "-nG", username])
@@ -147,28 +196,117 @@ for item in users:
             os.remove(sudo_config_file)
             result["errors"].append(proc.stderr.strip() or "visudo_failed")
 
-        existing_key_identities = set()
-        if os.path.exists(auth_keys):
-            with open(auth_keys) as f:
-                for line in f:
+        home_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        home_fd = os.open(user_home, home_flags)
+        ssh_fd = None
+        auth_fd = None
+        try:
+            ssh_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                ssh_fd = os.open(".ssh", ssh_flags, dir_fd=home_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(".ssh", mode=0o700, dir_fd=home_fd)
+                except FileExistsError:
+                    pass
+                ssh_fd = os.open(".ssh", ssh_flags, dir_fd=home_fd)
+
+            ssh_stat = os.fstat(ssh_fd)
+            if not stat.S_ISDIR(ssh_stat.st_mode):
+                raise OSError("ssh_directory_not_directory")
+            if not same_open_entry(ssh_fd, home_fd, ".ssh"):
+                raise OSError("ssh_directory_changed")
+            os.fchmod(ssh_fd, 0o700)
+            os.fchown(ssh_fd, entry.pw_uid, entry.pw_gid)
+
+            auth_flags = (
+                os.O_RDWR
+                | os.O_APPEND
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                auth_fd = os.open(
+                    "authorized_keys",
+                    auth_flags,
+                    dir_fd=ssh_fd,
+                )
+            except FileNotFoundError:
+                auth_fd = os.open(
+                    "authorized_keys",
+                    auth_flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=ssh_fd,
+                )
+
+            with locked_authorized_keys_file(auth_fd):
+                opened_stat = os.fstat(auth_fd)
+                if not stat.S_ISREG(opened_stat.st_mode):
+                    raise OSError("authorized_keys_not_regular")
+                if (
+                    not same_open_entry(ssh_fd, home_fd, ".ssh")
+                    or not same_open_entry(
+                        auth_fd, ssh_fd, "authorized_keys"
+                    )
+                ):
+                    raise OSError("authorized_keys_changed")
+
+                os.fchmod(auth_fd, 0o600)
+                os.fchown(auth_fd, entry.pw_uid, entry.pw_gid)
+                original_size = opened_stat.st_size
+                existing_content = b""
+                while len(existing_content) < original_size:
+                    chunk = os.pread(
+                        auth_fd,
+                        original_size - len(existing_content),
+                        len(existing_content),
+                    )
+                    if not chunk:
+                        break
+                    existing_content += chunk
+                if len(existing_content) != original_size:
+                    raise OSError("authorized_keys_changed")
+
+                existing_key_identities = set()
+                for line in existing_content.decode(
+                    "utf-8", "surrogateescape"
+                ).splitlines():
                     identity = public_key_identity(line)
                     if identity is not None:
                         existing_key_identities.add(identity)
 
-        with open(auth_keys, "a") as f:
-            for ssh_key in ssh_keys:
-                normalized_key = " ".join(ssh_key.strip().split())
-                identity = public_key_identity(normalized_key)
-                if identity is not None and identity in existing_key_identities:
-                    result["keys_already_present"] += 1
-                    continue
-                f.write(normalized_key + "\\n")
-                if identity is not None:
-                    existing_key_identities.add(identity)
-                result["keys_added"] += 1
+                for ssh_key in ssh_keys:
+                    normalized_key = " ".join(ssh_key.strip().split())
+                    identity = public_key_identity(normalized_key)
+                    if identity is not None and identity in existing_key_identities:
+                        result["keys_already_present"] += 1
+                        continue
+                    # Keep this key on its own line even if another writer
+                    # concurrently appended an unterminated line.
+                    encoded_key = b"\\n" + (normalized_key + "\\n").encode()
+                    if os.write(auth_fd, encoded_key) != len(encoded_key):
+                        raise OSError("authorized_keys_short_write")
+                    if identity is not None:
+                        existing_key_identities.add(identity)
+                    result["keys_added"] += 1
+                os.fsync(auth_fd)
 
-        os.chmod(auth_keys, 0o600)
-        shutil.chown(auth_keys, user=username, group=entry.pw_gid)
+                if (
+                    not same_open_entry(ssh_fd, home_fd, ".ssh")
+                    or not same_open_entry(
+                        auth_fd, ssh_fd, "authorized_keys"
+                    )
+                ):
+                    raise OSError("authorized_keys_changed")
+        finally:
+            if auth_fd is not None:
+                os.close(auth_fd)
+            if ssh_fd is not None:
+                os.close(ssh_fd)
+            os.close(home_fd)
     except Exception as exc:
         result["errors"].append(exc.__class__.__name__)
 
@@ -236,16 +374,16 @@ def build_remove_user_keys_command(username, ssh_keys):
         }
     )
     identity_helper = _public_key_identity_helper_source()
+    lock_helper = _authorized_keys_lock_helper_source()
     script = f"""
 import hashlib
 import json
 import os
 import pwd
-import shutil
 import stat
-import tempfile
 
 {identity_helper}
+{lock_helper}
 
 username = {json.dumps(username)}
 selected_key_ids = set({json.dumps(selected_key_ids)})
@@ -279,45 +417,141 @@ if result["uid"] is not None and result["uid"] < {MIN_MANAGED_UID}:
     print(json.dumps(result, ensure_ascii=False))
     raise SystemExit(0)
 
-auth_keys = os.path.join(entry.pw_dir, ".ssh", "authorized_keys")
+def read_prefix(file_fd, size):
+    content = b""
+    while len(content) < size:
+        chunk = os.pread(file_fd, size - len(content), len(content))
+        if not chunk:
+            break
+        content += chunk
+    return content
+
+def revoked_line(line):
+    if line.endswith(b"\\r\\n"):
+        body = line[:-2]
+        ending = b"\\r\\n"
+    elif line.endswith((b"\\n", b"\\r")):
+        body = line[:-1]
+        ending = line[-1:]
+    else:
+        body = line
+        ending = b""
+    if not body:
+        return line
+    marker = b"# gpu-monitor revoked"
+    if len(body) < len(marker):
+        marker = b"#"
+    return marker + (b" " * (len(body) - len(marker))) + ending
+
+home_fd = None
+ssh_fd = None
+auth_fd = None
 try:
-    if os.path.lexists(auth_keys):
-        result["authorized_keys_exists"] = True
-        auth_keys_stat = os.lstat(auth_keys)
-        if not stat.S_ISREG(auth_keys_stat.st_mode):
-            raise OSError("authorized_keys_not_regular")
-        with open(auth_keys) as f:
-            existing_lines = f.readlines()
+    home_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        home_fd = os.open(entry.pw_dir, home_flags)
+    except FileNotFoundError:
+        home_fd = None
 
-        kept_lines = []
-        removed_key_ids = set()
-        for line in existing_lines:
-            key_id = public_key_id(line)
-            if key_id is not None and key_id in selected_key_ids:
-                result["keys_removed"] += 1
-                removed_key_ids.add(key_id)
-                continue
-            kept_lines.append(line)
+    if home_fd is not None:
+        ssh_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            ssh_fd = os.open(".ssh", ssh_flags, dir_fd=home_fd)
+        except FileNotFoundError:
+            ssh_fd = None
 
-        if result["keys_removed"]:
-            temp_fd, temp_path = tempfile.mkstemp(
-                prefix=".authorized_keys.gpu-monitor-",
-                dir=os.path.dirname(auth_keys),
-                text=True,
+    if ssh_fd is not None:
+        auth_flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            auth_fd = os.open(
+                "authorized_keys",
+                auth_flags,
+                dir_fd=ssh_fd,
             )
-            try:
-                with os.fdopen(temp_fd, "w") as f:
-                    f.writelines(kept_lines)
-                os.chmod(temp_path, 0o600)
-                shutil.chown(temp_path, user=username, group=entry.pw_gid)
-                os.replace(temp_path, auth_keys)
-            finally:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+        except FileNotFoundError:
+            auth_fd = None
 
-        result["removed_key_ids"] = sorted(removed_key_ids)
+    if auth_fd is not None:
+        result["authorized_keys_exists"] = True
+        with locked_authorized_keys_file(auth_fd):
+            ssh_stat = os.fstat(ssh_fd)
+            opened_stat = os.fstat(auth_fd)
+            if not stat.S_ISDIR(ssh_stat.st_mode):
+                raise OSError("ssh_directory_not_directory")
+            if not stat.S_ISREG(opened_stat.st_mode):
+                raise OSError("authorized_keys_not_regular")
+            if (
+                not same_open_entry(ssh_fd, home_fd, ".ssh")
+                or not same_open_entry(
+                    auth_fd, ssh_fd, "authorized_keys"
+                )
+            ):
+                result["errors"].append("authorized_keys_changed")
+            else:
+                original_size = opened_stat.st_size
+                original_content = read_prefix(auth_fd, original_size)
+                if len(original_content) != original_size:
+                    result["errors"].append("authorized_keys_changed")
+                else:
+                    replacements = []
+                    offset = 0
+                    for line in original_content.splitlines(keepends=True):
+                        key_id = public_key_id(
+                            line.decode("utf-8", "surrogateescape")
+                        )
+                        if key_id is not None and key_id in selected_key_ids:
+                            replacements.append(
+                                (offset, line, revoked_line(line), key_id)
+                            )
+                        offset += len(line)
+
+                    prefix_unchanged = (
+                        same_open_entry(ssh_fd, home_fd, ".ssh")
+                        and same_open_entry(
+                            auth_fd, ssh_fd, "authorized_keys"
+                        )
+                        and os.fstat(auth_fd).st_size >= original_size
+                        and read_prefix(auth_fd, original_size) == original_content
+                    )
+                    if not prefix_unchanged:
+                        result["errors"].append("authorized_keys_changed")
+                    else:
+                        removed_key_ids = set()
+                        for offset, original_line, replacement, key_id in replacements:
+                            if (
+                                os.pread(auth_fd, len(original_line), offset)
+                                != original_line
+                            ):
+                                result["errors"].append("authorized_keys_changed")
+                                break
+                            written = os.pwrite(auth_fd, replacement, offset)
+                            if written != len(replacement):
+                                raise OSError("authorized_keys_short_write")
+                            result["keys_removed"] += 1
+                            removed_key_ids.add(key_id)
+                        if replacements:
+                            os.fsync(auth_fd)
+                        result["removed_key_ids"] = sorted(removed_key_ids)
+                        if (
+                            not same_open_entry(ssh_fd, home_fd, ".ssh")
+                            or not same_open_entry(
+                                auth_fd, ssh_fd, "authorized_keys"
+                            )
+                        ):
+                            result["errors"].append("authorized_keys_changed")
 except Exception as exc:
     result["errors"].append("authorized_keys_" + exc.__class__.__name__)
+finally:
+    if auth_fd is not None:
+        os.close(auth_fd)
+    if ssh_fd is not None:
+        os.close(ssh_fd)
+    if home_fd is not None:
+        os.close(home_fd)
 
 print(json.dumps(result, ensure_ascii=False))
 """

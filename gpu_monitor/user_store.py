@@ -155,6 +155,31 @@ def find_ssh_key_matches(ssh_key):
 
 def append_user_key_unlocked(username, normalized_key):
     USER_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(USER_FILE_PATH) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+
+    marker_replaced = False
+    updated_lines = []
+    for line in lines:
+        parts = line.strip().split(None, 1)
+        if len(parts) == 1 and parts[0] == username:
+            if not marker_replaced:
+                updated_lines.append(f"{username} {normalized_key}\n")
+                marker_replaced = True
+            continue
+        updated_lines.append(line)
+
+    if marker_replaced:
+        tmp_path = USER_FILE_PATH.with_suffix(USER_FILE_PATH.suffix + ".tmp")
+        with open(tmp_path, "w") as f:
+            f.writelines(updated_lines)
+        os.replace(tmp_path, USER_FILE_PATH)
+        _bump_user_store_generation()
+        return
+
     needs_newline = False
     try:
         with open(USER_FILE_PATH, "rb") as f:
@@ -191,7 +216,7 @@ def remove_user_from_file(username):
                 kept_lines.append(line)
                 continue
             parts = stripped.split(None, 1)
-            if len(parts) == 2 and parts[0] == username:
+            if parts[0] == username:
                 removed_lines += 1
                 continue
             kept_lines.append(line)
@@ -238,6 +263,7 @@ def remove_user_keys_from_file(username, key_ids):
         removed_lines = 0
         removed_key_ids = set()
         remaining_key_ids = set()
+        account_insert_index = None
         for line in lines:
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
@@ -245,8 +271,13 @@ def remove_user_keys_from_file(username, key_ids):
                 continue
 
             parts = stripped.split(None, 1)
-            if len(parts) != 2 or parts[0] != username:
+            if parts[0] != username:
                 kept_lines.append(line)
+                continue
+
+            if account_insert_index is None:
+                account_insert_index = len(kept_lines)
+            if len(parts) == 1:
                 continue
 
             key_id = ssh_key_id(parts[1])
@@ -259,6 +290,13 @@ def remove_user_keys_from_file(username, key_ids):
             kept_lines.append(line)
 
         if removed_lines:
+            if not remaining_key_ids:
+                kept_lines.insert(
+                    account_insert_index
+                    if account_insert_index is not None
+                    else len(kept_lines),
+                    f"{username}\n",
+                )
             tmp_path = USER_FILE_PATH.with_suffix(USER_FILE_PATH.suffix + ".tmp")
             with open(tmp_path, "w") as f:
                 f.writelines(kept_lines)
@@ -294,6 +332,7 @@ def add_user_key(username, ssh_key):
 
 
 def load_user_keys():
+    """Load managed accounts; a bare username represents an account with no keys."""
     users = {}
     with user_file_lock:
         try:
@@ -303,14 +342,10 @@ def load_user_keys():
                     if not stripped or stripped.startswith("#"):
                         continue
                     parts = stripped.split(None, 1)
-                    if len(parts) != 2:
-                        logger.warning(f"Invalid user line {line_no} in {USER_FILE_PATH}")
-                        continue
-                    username, ssh_key = parts
+                    username = parts[0]
                     if not USERNAME_PATTERN.match(username):
                         logger.warning(f"Invalid username {username} in {USER_FILE_PATH}")
                         continue
-                    fingerprint = key_fingerprint(ssh_key)
                     if username not in users:
                         users[username] = {
                             "username": username,
@@ -318,6 +353,10 @@ def load_user_keys():
                             "key_ids": set(),
                             "ssh_keys": [],
                         }
+                    if len(parts) == 1:
+                        continue
+                    ssh_key = parts[1]
+                    fingerprint = key_fingerprint(ssh_key)
                     users[username]["key_hashes"].add(fingerprint)
                     users[username]["key_ids"].add(ssh_key_id(ssh_key))
                     if ssh_key not in users[username]["ssh_keys"]:

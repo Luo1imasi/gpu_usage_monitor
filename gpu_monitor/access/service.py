@@ -6,6 +6,7 @@ import logging
 import re
 import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from gpu_monitor.access.remote_commands import (
@@ -48,6 +49,44 @@ KEY_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 admin_executor = ThreadPoolExecutor(max_workers=ADMIN_MAX_WORKERS)
 access_matrix_cache = {}
 access_matrix_cache_lock = threading.Lock()
+access_matrix_cache_generation = 0
+user_operation_locks = {}
+user_operation_locks_lock = threading.Lock()
+
+
+@contextmanager
+def serialize_user_operations(usernames):
+    """Serialize mutations per user while allowing unrelated users to proceed."""
+    ordered_usernames = sorted(
+        {username for username in usernames if isinstance(username, str)}
+    )
+    reservations = []
+    with user_operation_locks_lock:
+        for username in ordered_usernames:
+            entry = user_operation_locks.get(username)
+            if entry is None:
+                entry = {"lock": threading.RLock(), "references": 0}
+                user_operation_locks[username] = entry
+            entry["references"] += 1
+            reservations.append((username, entry))
+
+    acquired = []
+    try:
+        for _, entry in reservations:
+            entry["lock"].acquire()
+            acquired.append(entry["lock"])
+        yield
+    finally:
+        for lock in reversed(acquired):
+            lock.release()
+        with user_operation_locks_lock:
+            for username, entry in reservations:
+                entry["references"] -= 1
+                if (
+                    entry["references"] == 0
+                    and user_operation_locks.get(username) is entry
+                ):
+                    del user_operation_locks[username]
 
 
 def shutdown():
@@ -75,8 +114,10 @@ def wait_for_shutdown(timeout=2):
 
 
 def invalidate_access_matrix_cache():
+    global access_matrix_cache_generation
     with access_matrix_cache_lock:
         access_matrix_cache.clear()
+        access_matrix_cache_generation += 1
 
 
 def normalize_name_list(value):
@@ -138,18 +179,34 @@ def configure_access_for_server(server, users):
 
 
 def configure_selected_access(server_names, usernames):
+    with serialize_user_operations(usernames):
+        return _configure_selected_access_locked(server_names, usernames)
+
+
+def _configure_selected_access_locked(server_names, usernames):
     servers_by_name = get_servers_by_name()
     users_by_name = get_users_by_name()
 
     unknown_servers = sorted(set(server_names) - set(servers_by_name))
     unknown_users = sorted(set(usernames) - set(users_by_name))
-    if unknown_servers or unknown_users:
-        return {
+    users_without_keys = sorted(
+        {
+            username
+            for username in usernames
+            if username in users_by_name
+            and not users_by_name[username].get("ssh_keys")
+        }
+    )
+    if unknown_servers or unknown_users or users_without_keys:
+        result = {
             "error": "invalid_selection",
             "unknown_servers": unknown_servers,
             "unknown_users": unknown_users,
             "results": [],
-        }, 400
+        }
+        if users_without_keys:
+            result["users_without_keys"] = users_without_keys
+        return result, 400
 
     selected_servers = [servers_by_name[name] for name in server_names]
     selected_users = [users_by_name[username] for username in usernames]
@@ -181,6 +238,16 @@ def configure_selected_access(server_names, usernames):
 
 
 def configure_access_pairs(pairs):
+    usernames = [
+        pair.get("user")
+        for pair in pairs
+        if isinstance(pair, dict) and isinstance(pair.get("user"), str)
+    ]
+    with serialize_user_operations(usernames):
+        return _configure_access_pairs_locked(pairs)
+
+
+def _configure_access_pairs_locked(pairs):
     servers_by_name = get_servers_by_name()
     users_by_name = get_users_by_name()
 
@@ -212,6 +279,23 @@ def configure_access_pairs(pairs):
             "results": [],
         }, 400
 
+    users_without_keys = sorted(
+        {
+            username
+            for server_users in grouped_users.values()
+            for username in server_users
+            if not users_by_name[username].get("ssh_keys")
+        }
+    )
+    if users_without_keys:
+        return {
+            "error": "invalid_selection",
+            "unknown_servers": [],
+            "unknown_users": [],
+            "users_without_keys": users_without_keys,
+            "results": [],
+        }, 400
+
     futures = {}
     for server_name, server_users in grouped_users.items():
         selected_users = [users_by_name[username] for username in sorted(server_users)]
@@ -240,6 +324,138 @@ def configure_access_pairs(pairs):
     results.sort(key=lambda item: item["server"])
     invalidate_access_matrix_cache()
     return {"error": None, "results": results}, 200
+
+
+def revoke_access_pairs(pairs):
+    usernames = []
+    if isinstance(pairs, list):
+        usernames = [
+            pair.get("user")
+            for pair in pairs
+            if isinstance(pair, dict) and isinstance(pair.get("user"), str)
+        ]
+    with serialize_user_operations(usernames):
+        return _revoke_access_pairs_locked(pairs)
+
+
+def _revoke_access_pairs_locked(pairs):
+    """Remove managed SSH keys from selected user/server pairs only.
+
+    The local key inventory is intentionally preserved because the same key may
+    still be authorized on other servers and can be used to grant access again.
+    """
+    if not isinstance(pairs, list):
+        return {"error": "pairs_must_be_a_list", "results": []}, 400
+    if not pairs:
+        return {"error": "select_at_least_one_access_pair", "results": []}, 400
+
+    servers_by_name = get_servers_by_name()
+    users_by_name = get_users_by_name()
+    selected_pairs = []
+    seen_pairs = set()
+    requested_usernames = set()
+    unknown_servers = set()
+    unknown_users = set()
+
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            return {"error": "pairs_must_contain_objects", "results": []}, 400
+        server_name = pair.get("server")
+        username = pair.get("user")
+        if not isinstance(server_name, str) or not isinstance(username, str):
+            return {
+                "error": "pair_server_and_user_must_be_strings",
+                "results": [],
+            }, 400
+
+        requested_usernames.add(username)
+        if server_name not in servers_by_name:
+            unknown_servers.add(server_name)
+        if username not in users_by_name:
+            unknown_users.add(username)
+
+        pair_key = (server_name, username)
+        if pair_key not in seen_pairs:
+            seen_pairs.add(pair_key)
+            selected_pairs.append(pair_key)
+
+    configured_ssh_users = {
+        server.get("username")
+        for server in servers_by_name.values()
+        if isinstance(server.get("username"), str)
+    }
+    protected_users = sorted(
+        requested_usernames & (PROTECTED_USERNAMES | configured_ssh_users)
+    )
+    if unknown_servers or unknown_users or protected_users:
+        result = {
+            "error": "invalid_selection",
+            "unknown_servers": sorted(unknown_servers),
+            "unknown_users": sorted(unknown_users),
+            "results": [],
+        }
+        if protected_users:
+            result["protected_users"] = protected_users
+        return result, 400
+
+    users_without_keys = sorted(
+        {
+            username
+            for _, username in selected_pairs
+            if not users_by_name[username].get("ssh_keys")
+        }
+    )
+    if users_without_keys:
+        return {
+            "error": "invalid_selection",
+            "unknown_servers": [],
+            "unknown_users": [],
+            "users_without_keys": users_without_keys,
+            "results": [],
+        }, 400
+
+    futures = {}
+    for server_name, username in selected_pairs:
+        server = servers_by_name[server_name]
+        future = admin_executor.submit(
+            remove_user_keys_on_server,
+            server,
+            username,
+            users_by_name[username]["ssh_keys"],
+        )
+        futures[future] = (server, username)
+
+    results = []
+    for future in as_completed(futures):
+        server, username = futures[future]
+        try:
+            result = future.result()
+            results.append(
+                {**result, "server": server["name"], "user": username}
+            )
+        except Exception as e:
+            logger.error(
+                "Unexpected access-key removal error for %s on %s: %s",
+                username,
+                server["name"],
+                e,
+            )
+            results.append(
+                {
+                    "server": server["name"],
+                    "user": username,
+                    "error": sanitize_error(str(e)),
+                    "result": {},
+                }
+            )
+
+    results.sort(key=lambda item: (item["server"], item["user"]))
+    invalidate_access_matrix_cache()
+    return {
+        "error": None,
+        "local_keys_preserved": True,
+        "results": results,
+    }, 200
 
 
 def configured_ssh_usernames():
@@ -523,6 +739,11 @@ def normalize_key_id_selection(payload):
 
 
 def delete_user_keys(username, payload):
+    with serialize_user_operations([username]):
+        return _delete_user_keys_locked(username, payload)
+
+
+def _delete_user_keys_locked(username, payload):
     if not validate_username(username):
         return {"error": "invalid_username", "results": []}, 400
     if is_protected_username(username):
@@ -612,6 +833,11 @@ def delete_user_keys(username, payload):
 
 
 def delete_user_access(username, payload):
+    with serialize_user_operations([username]):
+        return _delete_user_access_locked(username, payload)
+
+
+def _delete_user_access_locked(username, payload):
     if not isinstance(payload, dict):
         return {"error": "request_body_must_be_an_object", "results": []}, 400
     if not validate_username(username):
@@ -816,13 +1042,24 @@ def resolve_access_matrix_scope(server_names=None, usernames=None):
     return selected_servers, selected_users, scope, None
 
 
-def access_matrix_cache_key(servers, users):
+def access_matrix_source_version():
+    with access_matrix_cache_lock:
+        cache_generation = access_matrix_cache_generation
     return (
-        tuple(server["name"] for server in servers),
-        tuple(user["username"] for user in users),
+        cache_generation,
         get_user_store_generation(),
         get_file_signature(USER_FILE_PATH),
         get_file_signature(CONFIG_PATH),
+    )
+
+
+def access_matrix_cache_key(servers, users, source_version=None):
+    if source_version is None:
+        source_version = access_matrix_source_version()
+    return (
+        tuple(server["name"] for server in servers),
+        tuple(user["username"] for user in users),
+        *source_version,
     )
 
 
@@ -842,7 +1079,12 @@ def get_cached_access_matrix(key):
         return result
 
 
-def set_cached_access_matrix(key, matrix):
+def set_cached_access_matrix(key, matrix, source_version=None):
+    if (
+        source_version is not None
+        and source_version != access_matrix_source_version()
+    ):
+        return False
     with access_matrix_cache_lock:
         access_matrix_cache[key] = (time.time(), copy.deepcopy(matrix))
         if len(access_matrix_cache) > ACCESS_MATRIX_CACHE_MAX_ENTRIES:
@@ -851,18 +1093,28 @@ def set_cached_access_matrix(key, matrix):
                 key=lambda item: access_matrix_cache[item][0],
             )
             del access_matrix_cache[oldest_key]
+    return True
+
+
+def access_matrix_changed_response():
+    return {
+        "error": "access_matrix_changed",
+        "servers": [],
+        "users": [],
+    }, 409
 
 
 def build_access_matrix(server_names=None, usernames=None):
+    source_version = access_matrix_source_version()
     servers, users, scope, error = resolve_access_matrix_scope(
         server_names, usernames
     )
     if error:
         return {**error, "servers": [], "users": []}, 400
 
-    cache_key = access_matrix_cache_key(servers, users)
+    cache_key = access_matrix_cache_key(servers, users, source_version)
     cached = get_cached_access_matrix(cache_key)
-    if cached:
+    if cached and source_version == access_matrix_source_version():
         return cached, 200
 
     matrix = {
@@ -886,7 +1138,9 @@ def build_access_matrix(server_names=None, usernames=None):
     }
 
     if not users or not servers:
-        set_cached_access_matrix(cache_key, matrix)
+        if source_version != access_matrix_source_version():
+            return access_matrix_changed_response()
+        set_cached_access_matrix(cache_key, matrix, source_version)
         return matrix, 200
 
     server_results = check_access_matrix_for_servers(servers, users)
@@ -955,5 +1209,7 @@ def build_access_matrix(server_names=None, usernames=None):
                 }
             )
 
-    set_cached_access_matrix(cache_key, matrix)
+    if source_version != access_matrix_source_version():
+        return access_matrix_changed_response()
+    set_cached_access_matrix(cache_key, matrix, source_version)
     return matrix, 200

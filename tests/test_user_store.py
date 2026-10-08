@@ -83,6 +83,57 @@ class UserStoreTests(unittest.TestCase):
         users = user_store.load_user_keys()
         self.assertEqual(users[0]["ssh_keys"], [second_key])
 
+    def test_remove_last_key_keeps_zero_key_account_marker(self):
+        ssh_key = make_public_key("laptop")
+        user_store.add_user_key("alice", ssh_key)
+
+        result, status = user_store.remove_user_keys_from_file(
+            "alice", [user_store.ssh_key_id(ssh_key)]
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["removed_keys"], 1)
+        self.assertEqual(result["remaining_key_count"], 0)
+        self.assertEqual(self.user_file.read_text(), "alice\n")
+        self.assertEqual(
+            user_store.load_user_keys(),
+            [
+                {
+                    "username": "alice",
+                    "key_hashes": [],
+                    "key_ids": [],
+                    "ssh_keys": [],
+                }
+            ],
+        )
+
+    def test_add_key_replaces_zero_key_account_marker(self):
+        ssh_key = make_public_key("replacement")
+        self.user_file.write_text("alice\n")
+
+        result, status = user_store.add_user_key("alice", ssh_key)
+
+        self.assertEqual(status, 200)
+        self.assertTrue(result["key_added"])
+        self.assertEqual(self.user_file.read_text(), f"alice {ssh_key}\n")
+        self.assertEqual(user_store.load_user_keys()[0]["ssh_keys"], [ssh_key])
+
+    def test_remove_user_removes_marker_and_key_lines(self):
+        ssh_key = make_public_key("legacy")
+        bob_key = make_public_key("bob", b"bob-key")
+        self.user_file.write_text(
+            f"# accounts\nalice\nalice {ssh_key}\nbob {bob_key}\n"
+        )
+
+        result, status = user_store.remove_user_from_file("alice")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["removed_lines"], 2)
+        self.assertEqual(self.user_file.read_text(), f"# accounts\nbob {bob_key}\n")
+        self.assertEqual(
+            [user["username"] for user in user_store.load_user_keys()], ["bob"]
+        )
+
     def test_generation_changes_after_successful_mutations(self):
         original_generation = user_store.get_user_store_generation()
         user_store.add_user_key("alice", make_public_key())

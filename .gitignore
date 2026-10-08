@@ -24,6 +24,8 @@ instance/
 # Commit config.example.json instead of config.json.
 config.json
 user.txt
+auth.sqlite3*
+node_modules/
 
 # Editor/OS files
 .DS_Store
