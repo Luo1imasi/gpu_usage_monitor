@@ -1225,6 +1225,7 @@
         }
         
     </style>
+    <link rel="stylesheet" href="/login-assets/fonts.css">
     <link rel="stylesheet" href="/login-assets/monitor.css">
     <script src="/login-assets/ui.js" defer></script>
 </head>
@@ -1400,6 +1401,33 @@
 
         function sumProcesses(gpus) {
             return (gpus || []).reduce((count, gpu) => count + ((gpu.processes && gpu.processes.length) || 0), 0);
+        }
+
+        function createServerOccupancy(gpus, stale) {
+            const cards = Array.isArray(gpus) ? gpus : [];
+            const occupied = cards.filter(gpu =>
+                (gpu.processes && gpu.processes.length > 0) || Number(gpu.gpu_util) > 0
+            ).length;
+            const ratio = cards.length > 0 ? occupied / cards.length : 0;
+            const hue = ratio <= 0.5 ? 145 - ratio * 200 : (1 - ratio) * 90;
+            const summary = document.createElement('span');
+            summary.className = 'server-occupancy';
+            summary.dataset.occupied = occupied;
+            summary.dataset.total = cards.length;
+            summary.style.setProperty('--occupancy-color', stale || cards.length === 0
+                ? 'var(--muted)' : 'hsl(' + Math.round(hue) + ', 65%, 70%)');
+            summary.title = (stale ? '上次采样：' : '') + '占用 ' + occupied + ' / '
+                + cards.length + ' 张 GPU' + (cards.length === 0 ? '（无 GPU 数据）' : '');
+            summary.setAttribute('aria-label', summary.title + '，' + sumProcesses(cards) + ' 个进程');
+            const gpuCount = document.createElement('span');
+            gpuCount.className = 'occupancy-gpus';
+            gpuCount.textContent = occupied + '/' + cards.length + ' GPUs';
+            const processCount = document.createElement('span');
+            processCount.className = 'occupancy-procs';
+            processCount.textContent = '/ ' + sumProcesses(cards) + ' procs';
+            summary.appendChild(gpuCount);
+            summary.appendChild(processCount);
+            return summary;
         }
 
         function clampPercent(value) {
@@ -3364,11 +3392,7 @@
                     serverHeader.appendChild(serverInfo);
                     const serverMeta = document.createElement('div');
                     serverMeta.className = 'server-summary-meta monitor-card-meta';
-                    const gpuCount = s.gpus ? s.gpus.length : 0;
-                    const procCount = sumProcesses(s.gpus);
-                    const serverCount = document.createElement('span');
-                    serverCount.className = 'summary-count';
-                    serverCount.textContent = gpuCount + ' GPUs / ' + procCount + ' procs';
+                    const serverCount = createServerOccupancy(s.gpus, s.stale);
                     const caret = createCaret();
                     serverMeta.appendChild(serverCount);
                     serverMeta.appendChild(status);

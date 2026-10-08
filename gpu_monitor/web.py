@@ -80,7 +80,8 @@ def login_page():
 
 @bp.route("/login-assets/<filename>")
 def login_asset(filename):
-    if filename not in {"login.js", "login-worker.js", "login.css", "ui.js", "monitor.css"}:
+    if filename not in {"login.js", "login-worker.js", "login.css", "ui.js", "monitor.css",
+                        "fonts.css", "inter-latin.woff2"}:
         return "", 404
     return send_from_directory(Path(__file__).resolve().parent.parent / "static", filename)
 
