@@ -59,7 +59,13 @@ def same_origin_request():
 
 @bp.after_request
 def security_headers(response):
-    response.headers["Cache-Control"] = "no-store"
+    # Login assets are versioned by deployment and safe to reuse.  Keeping
+    # them out of the global no-store policy makes returning to the login page
+    # substantially faster after an expired session.
+    if request.endpoint == "gpu_monitor.login_asset":
+        response.headers["Cache-Control"] = "public, max-age=86400"
+    else:
+        response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     if request.endpoint == "gpu_monitor.login_asset":

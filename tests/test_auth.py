@@ -60,6 +60,7 @@ class AuthenticationTests(unittest.TestCase):
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         worker = self.client.get("/login-assets/login-worker.js")
         self.assertIn("connect-src 'none'", worker.headers["Content-Security-Policy"])
+        self.assertEqual(worker.headers["Cache-Control"], "public, max-age=86400")
         worker.close()
 
     def test_replay_and_wrong_signature_are_rejected(self):

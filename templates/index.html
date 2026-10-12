@@ -1370,6 +1370,7 @@
         });
         let refreshInterval = 2;
         let gpuRefreshTimer = null;
+        let storageRefreshTimer = null;
         let configuredServers = [];
         let latestAccessMatrix = null;
         let latestDetectedUserItems = [];
@@ -1554,6 +1555,16 @@
             }
         }
 
+        function updateStorageRefreshTimer() {
+            if (storageRefreshTimer !== null) {
+                clearInterval(storageRefreshTimer);
+                storageRefreshTimer = null;
+            }
+            if (!document.hidden) {
+                storageRefreshTimer = setInterval(refreshStorage, 60000);
+            }
+        }
+
         async function init() {
             document.getElementById('configure-access').addEventListener('click', configureSelectedAccess);
             document.getElementById('revoke-access').addEventListener('click', revokeSelectedAccess);
@@ -1573,6 +1584,17 @@
             document.getElementById('key-delete-dialog').addEventListener('cancel', event => {
                 if (pendingKeyDeletion && pendingKeyDeletion.busy) {
                     event.preventDefault();
+                }
+            });
+            // Register this before the initial requests. A tab can be hidden or
+            // suspended while those requests are in flight; the next visible
+            // event must still restart polling and fetch a fresh snapshot.
+            document.addEventListener('visibilitychange', () => {
+                updateGpuRefreshTimer();
+                updateStorageRefreshTimer();
+                if (!document.hidden) {
+                    refresh();
+                    refreshStorage();
                 }
             });
             document.getElementById('ssh-key-input').addEventListener('keydown', event => {
@@ -1603,19 +1625,13 @@
             
             await Promise.all([refresh(), refreshStorage()]);
             updateGpuRefreshTimer();
-            document.addEventListener('visibilitychange', () => {
-                updateGpuRefreshTimer();
-                if (!document.hidden) {
-                    refresh();
-                }
-            });
-            setInterval(refreshStorage, 60000);
+            updateStorageRefreshTimer();
         }
         
         async function refresh() {
             const requestSequence = ++gpuRequestSequence;
             try {
-                const r = await fetch('/api/gpu');
+                const r = await fetch('/api/gpu', {signal: AbortSignal.timeout(15000)});
                 if (!r.ok) {
                     throw new Error('HTTP ' + r.status);
                 }
@@ -1657,7 +1673,7 @@
         async function refreshStorage() {
             const requestSequence = ++storageRequestSequence;
             try {
-                const response = await fetch('/api/storage');
+                const response = await fetch('/api/storage', {signal: AbortSignal.timeout(15000)});
                 if (!response.ok) {
                     throw new Error('HTTP ' + response.status);
                 }
